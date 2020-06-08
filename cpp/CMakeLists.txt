@@ -140,17 +140,30 @@ option(BUILD_TESTS "Configure CMake to build tests" ON)
 option(BUILD_BENCHMARKS "Configure CMake to build (google) benchmarks" OFF)
 
 ###################################################################################################
+# - Realm -----------------------------------------------------------------------------------------
+
+option(USE_REALM_HIJACK "Use Realm's CUDA hijack" OFF)
+if(USE_REALM_HIJACK)
+  find_library(REALM_LIBRARY "realm" HINTS "$ENV{REALM_ROOT}/lib")
+  message(STATUS "REALM: REALM_LIBRARY set to ${REALM_LIBRARY}")
+endif(USE_REALM_HIJACK)
+
+###################################################################################################
 # - cudart options --------------------------------------------------------------------------------
 # cudart can be statically linked or dynamically linked. The python ecosystem wants dynamic linking
 
 option(CUDA_STATIC_RUNTIME "Statically link the CUDA runtime" OFF)
 
-if(CUDA_STATIC_RUNTIME)
-    message(STATUS "Enabling static linking of cudart")
-    set(CUDART_LIBRARY "cudart_static")
+if(USE_REALM_HIJACK)
+    set(CUDART_LIBRARY "realm")
 else()
-    set(CUDART_LIBRARY "cudart")
-endif(CUDA_STATIC_RUNTIME)
+    if(CUDA_STATIC_RUNTIME)
+        message(STATUS "Enabling static linking of cudart")
+        set(CUDART_LIBRARY "cudart_static")
+    else()
+        set(CUDART_LIBRARY "cudart")
+    endif(CUDA_STATIC_RUNTIME)
+endif(USE_REALM_HIJACK)
 
 ###################################################################################################
 # - cmake modules ---------------------------------------------------------------------------------
@@ -375,6 +388,10 @@ link_directories("${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES}" # CMAKE_CUDA_IMPLICIT
 if(CONDA_LINK_DIRS)
     link_directories("${CONDA_LINK_DIRS}")
 endif(CONDA_LINK_DIRS)
+
+if(USE_REALM_HIJACK)
+    link_directories("$ENV{REALM_ROOT}/lib")
+endif(USE_REALM_HIJACK)
 
 ###################################################################################################
 # - library targets -------------------------------------------------------------------------------
