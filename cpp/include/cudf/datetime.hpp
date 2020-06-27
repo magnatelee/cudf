@@ -71,6 +71,7 @@ std::unique_ptr<column> extract_component(
  */
 std::unique_ptr<cudf::column> extract_year(
   cudf::column_view const& column,
+  cudaStream_t stream                 = 0,
   rmm::mr::device_memory_resource* mr = rmm::mr::get_default_resource());
 
 /**
@@ -84,6 +85,7 @@ std::unique_ptr<cudf::column> extract_year(
  */
 std::unique_ptr<cudf::column> extract_month(
   cudf::column_view const& column,
+  cudaStream_t stream                 = 0,
   rmm::mr::device_memory_resource* mr = rmm::mr::get_default_resource());
 
 /**
@@ -97,6 +99,7 @@ std::unique_ptr<cudf::column> extract_month(
  */
 std::unique_ptr<cudf::column> extract_day(
   cudf::column_view const& column,
+  cudaStream_t stream                 = 0,
   rmm::mr::device_memory_resource* mr = rmm::mr::get_default_resource());
 
 /**
@@ -110,6 +113,7 @@ std::unique_ptr<cudf::column> extract_day(
  */
 std::unique_ptr<cudf::column> extract_weekday(
   cudf::column_view const& column,
+  cudaStream_t stream                 = 0,
   rmm::mr::device_memory_resource* mr = rmm::mr::get_default_resource());
 
 /**
@@ -123,6 +127,7 @@ std::unique_ptr<cudf::column> extract_weekday(
  */
 std::unique_ptr<cudf::column> extract_hour(
   cudf::column_view const& column,
+  cudaStream_t stream                 = 0,
   rmm::mr::device_memory_resource* mr = rmm::mr::get_default_resource());
 
 /**
@@ -136,6 +141,7 @@ std::unique_ptr<cudf::column> extract_hour(
  */
 std::unique_ptr<cudf::column> extract_minute(
   cudf::column_view const& column,
+  cudaStream_t stream                 = 0,
   rmm::mr::device_memory_resource* mr = rmm::mr::get_default_resource());
 
 /**
@@ -149,6 +155,7 @@ std::unique_ptr<cudf::column> extract_minute(
  */
 std::unique_ptr<cudf::column> extract_second(
   cudf::column_view const& column,
+  cudaStream_t stream                 = 0,
   rmm::mr::device_memory_resource* mr = rmm::mr::get_default_resource());
 
 /** @} */  // end of group
