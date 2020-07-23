@@ -1,5 +1,4 @@
 # Copyright (c) 2018-2020, NVIDIA CORPORATION.
-
 from cudf.utils.gpu_utils import validate_setup  # isort:skip
 
 validate_setup(check_dask=False)
@@ -64,6 +63,8 @@ from cudf.io import (
     read_parquet,
 )
 from cudf.utils.utils import set_allocator
+
+from cudf import testing
 
 cuda.set_memory_manager(rmm.RMMNumbaManager)
 cupy.cuda.set_allocator(rmm.rmm_cupy_allocator)
