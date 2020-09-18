@@ -503,11 +503,12 @@ hash_join::hash_join_impl::inner_join(
   std::vector<std::pair<cudf::size_type, cudf::size_type>> const &columns_in_common,
   common_columns_output_side common_columns_output_side,
   null_equality compare_nulls,
-  rmm::mr::device_memory_resource *mr) const
+  rmm::mr::device_memory_resource *mr,
+  cudaStream_t stream) const
 {
   CUDF_FUNC_RANGE();
   return compute_hash_join<cudf::detail::join_kind::INNER_JOIN>(
-    probe, probe_on, columns_in_common, common_columns_output_side, compare_nulls, mr);
+    probe, probe_on, columns_in_common, common_columns_output_side, compare_nulls, mr, stream);
 }
 
 std::unique_ptr<cudf::table> hash_join::hash_join_impl::left_join(
@@ -515,11 +516,12 @@ std::unique_ptr<cudf::table> hash_join::hash_join_impl::left_join(
   std::vector<size_type> const &probe_on,
   std::vector<std::pair<cudf::size_type, cudf::size_type>> const &columns_in_common,
   null_equality compare_nulls,
-  rmm::mr::device_memory_resource *mr) const
+  rmm::mr::device_memory_resource *mr,
+  cudaStream_t stream) const
 {
   CUDF_FUNC_RANGE();
   auto probe_build_pair = compute_hash_join<cudf::detail::join_kind::LEFT_JOIN>(
-    probe, probe_on, columns_in_common, common_columns_output_side::PROBE, compare_nulls, mr);
+    probe, probe_on, columns_in_common, common_columns_output_side::PROBE, compare_nulls, mr, stream);
   return cudf::detail::combine_table_pair(std::move(probe_build_pair.first),
                                           std::move(probe_build_pair.second));
 }
@@ -529,11 +531,12 @@ std::unique_ptr<cudf::table> hash_join::hash_join_impl::full_join(
   std::vector<size_type> const &probe_on,
   std::vector<std::pair<cudf::size_type, cudf::size_type>> const &columns_in_common,
   null_equality compare_nulls,
-  rmm::mr::device_memory_resource *mr) const
+  rmm::mr::device_memory_resource *mr,
+  cudaStream_t stream) const
 {
   CUDF_FUNC_RANGE();
   auto probe_build_pair = compute_hash_join<cudf::detail::join_kind::FULL_JOIN>(
-    probe, probe_on, columns_in_common, common_columns_output_side::PROBE, compare_nulls, mr);
+    probe, probe_on, columns_in_common, common_columns_output_side::PROBE, compare_nulls, mr, stream);
   return cudf::detail::combine_table_pair(std::move(probe_build_pair.first),
                                           std::move(probe_build_pair.second));
 }

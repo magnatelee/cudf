@@ -224,21 +224,24 @@ struct hash_join::hash_join_impl {
     std::vector<std::pair<cudf::size_type, cudf::size_type>> const& columns_in_common,
     common_columns_output_side common_columns_output_side,
     null_equality compare_nulls,
-    rmm::mr::device_memory_resource* mr) const;
+    rmm::mr::device_memory_resource* mr,
+    cudaStream_t stream) const;
 
   std::unique_ptr<cudf::table> left_join(
     cudf::table_view const& probe,
     std::vector<size_type> const& probe_on,
     std::vector<std::pair<cudf::size_type, cudf::size_type>> const& columns_in_common,
     null_equality compare_nulls,
-    rmm::mr::device_memory_resource* mr) const;
+    rmm::mr::device_memory_resource* mr,
+    cudaStream_t stream) const;
 
   std::unique_ptr<cudf::table> full_join(
     cudf::table_view const& probe,
     std::vector<size_type> const& probe_on,
     std::vector<std::pair<cudf::size_type, cudf::size_type>> const& columns_in_common,
     null_equality compare_nulls,
-    rmm::mr::device_memory_resource* mr) const;
+    rmm::mr::device_memory_resource* mr,
+    cudaStream_t stream) const;
 
  private:
   /**

@@ -49,7 +49,8 @@ std::unique_ptr<table> inner_join(
                                               actual_columns_in_common,
                                               cudf::hash_join::common_columns_output_side::BUILD,
                                               compare_nulls,
-                                              mr);
+                                              mr,
+                                              stream);
     return cudf::detail::combine_table_pair(std::move(probe_build_pair.second),
                                             std::move(probe_build_pair.first));
   } else {
@@ -59,7 +60,8 @@ std::unique_ptr<table> inner_join(
                                               columns_in_common,
                                               cudf::hash_join::common_columns_output_side::PROBE,
                                               compare_nulls,
-                                              mr);
+                                              mr,
+                                              stream);
     return cudf::detail::combine_table_pair(std::move(probe_build_pair.first),
                                             std::move(probe_build_pair.second));
   }
@@ -108,10 +110,11 @@ std::pair<std::unique_ptr<cudf::table>, std::unique_ptr<cudf::table>> hash_join:
   std::vector<std::pair<cudf::size_type, cudf::size_type>> const& columns_in_common,
   common_columns_output_side common_columns_output_side,
   null_equality compare_nulls,
-  rmm::mr::device_memory_resource* mr) const
+  rmm::mr::device_memory_resource* mr,
+  cudaStream_t stream) const
 {
   return impl->inner_join(
-    probe, probe_on, columns_in_common, common_columns_output_side, compare_nulls, mr);
+    probe, probe_on, columns_in_common, common_columns_output_side, compare_nulls, mr, stream);
 }
 
 std::unique_ptr<cudf::table> hash_join::left_join(
@@ -119,9 +122,10 @@ std::unique_ptr<cudf::table> hash_join::left_join(
   std::vector<size_type> const& probe_on,
   std::vector<std::pair<cudf::size_type, cudf::size_type>> const& columns_in_common,
   null_equality compare_nulls,
-  rmm::mr::device_memory_resource* mr) const
+  rmm::mr::device_memory_resource* mr,
+  cudaStream_t stream) const
 {
-  return impl->left_join(probe, probe_on, columns_in_common, compare_nulls, mr);
+  return impl->left_join(probe, probe_on, columns_in_common, compare_nulls, mr, stream);
 }
 
 std::unique_ptr<cudf::table> hash_join::full_join(
@@ -129,9 +133,10 @@ std::unique_ptr<cudf::table> hash_join::full_join(
   std::vector<size_type> const& probe_on,
   std::vector<std::pair<cudf::size_type, cudf::size_type>> const& columns_in_common,
   null_equality compare_nulls,
-  rmm::mr::device_memory_resource* mr) const
+  rmm::mr::device_memory_resource* mr,
+  cudaStream_t stream) const
 {
-  return impl->full_join(probe, probe_on, columns_in_common, compare_nulls, mr);
+  return impl->full_join(probe, probe_on, columns_in_common, compare_nulls, mr, stream);
 }
 
 }  // namespace cudf
