@@ -17,8 +17,8 @@
 #include <cudf/column/column.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/detail/nvtx/ranges.hpp>
-#include <cudf/detail/search.hpp>
-#include <cudf/detail/stream_compaction.hpp>
+#include <cudf/detail/transform.hpp>
+#include <cudf/detail/unary.hpp>
 #include <cudf/dictionary/detail/encode.hpp>
 #include <cudf/dictionary/dictionary_factories.hpp>
 #include <cudf/dictionary/encode.hpp>
@@ -38,42 +38,26 @@ std::unique_ptr<column> encode(column_view const& input_column,
                                rmm::mr::device_memory_resource* mr,
                                cudaStream_t stream)
 {
-  CUDF_EXPECTS(indices_type.id() == type_id::INT32, "only type_id::INT32 type for indices");
+  CUDF_EXPECTS(indices_type.id() == type_id::UINT32, "only type_id::UINT32 type for indices");
   CUDF_EXPECTS(input_column.type().id() != type_id::DICTIONARY32,
                "cannot encode a dictionary from a dictionary");
 
-  // side effects of this function were are now dependent on:
-  // - resulting column elements are sorted ascending
-  // - nulls are sorted to the beginning
-  auto table_keys = cudf::detail::drop_duplicates(table_view{{input_column}},
-                                                  std::vector<size_type>{0},
-                                                  duplicate_keep_option::KEEP_FIRST,
-                                                  null_equality::EQUAL,
-                                                  mr,
-                                                  stream)
-                      ->release();  // true == nulls are equal
-  std::unique_ptr<column> keys_column(std::move(table_keys.front()));
+  auto codified       = cudf::detail::encode(cudf::table_view({input_column}), mr, stream);
+  auto keys_table     = std::move(codified.first);
+  auto indices_column = std::move(codified.second);
+  auto keys_column    = std::move(keys_table->release().front());
 
-  if (input_column.has_nulls()) {
-    // the single null entry should be at the beginning -- side effect from drop_duplicates
-    // copy the column without the null entry
+  if (keys_column->has_nulls()) {
     keys_column = std::make_unique<column>(
-      slice(keys_column->view(), std::vector<size_type>{1, keys_column->size()}).front(),
+      slice(keys_column->view(), std::vector<size_type>{0, keys_column->size() - 1}).front(),
       stream,
       mr);
     keys_column->set_null_mask(rmm::device_buffer{0, stream, mr}, 0);  // remove the null-mask
   }
 
-  // this returns a column with no null entries
-  // - it appears to ignore the null entries in the input and tries to place the value regardless
-  auto indices_column = cudf::detail::lower_bound(table_view{{keys_column->view()}},
-                                                  table_view{{input_column}},
-                                                  std::vector<order>{order::ASCENDING},
-                                                  std::vector<null_order>{null_order::AFTER},
-                                                  mr,
-                                                  stream);
-  // we should probably copy/cast to type_id::INT32 type if different
-  CUDF_EXPECTS(indices_column->type() == indices_type, "expecting type_id::INT32 indices type");
+  // the encode() returns INT32 for indices
+  if (indices_column->type().id() != indices_type.id())
+    indices_column = cudf::detail::cast(indices_column->view(), indices_type, mr, stream);
 
   // create column with keys_column and indices_column
   return make_dictionary_column(std::move(keys_column),

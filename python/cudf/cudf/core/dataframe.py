@@ -3,7 +3,6 @@ from __future__ import division, print_function
 
 import inspect
 import itertools
-import logging
 import numbers
 import pickle
 import sys
@@ -17,14 +16,16 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 from numba import cuda
+from pandas._config import get_option
 from pandas.api.types import is_dict_like
+from pandas.io.formats import console
 from pandas.io.formats.printing import pprint_thing
 
 import cudf
 from cudf import _lib as libcudf
 from cudf._lib.null_mask import MaskState, create_null_mask
 from cudf._lib.nvtx import annotate
-from cudf.core import column
+from cudf.core import column, reshape
 from cudf.core.abc import Serializable
 from cudf.core.column import as_column, column_empty
 from cudf.core.column_accessor import ColumnAccessor
@@ -34,12 +35,12 @@ from cudf.core.index import Index, RangeIndex, as_index
 from cudf.core.indexing import _DataFrameIlocIndexer, _DataFrameLocIndexer
 from cudf.core.series import Series
 from cudf.core.window import Rolling
-from cudf.utils import applyutils, ioutils, queryutils, utils
+from cudf.utils import applyutils, docutils, ioutils, queryutils, utils
 from cudf.utils.docutils import copy_docstring
 from cudf.utils.dtypes import (
     cudf_dtype_from_pydata_dtype,
     is_categorical_dtype,
-    is_datetime_dtype,
+    is_list_dtype,
     is_list_like,
     is_scalar,
     is_string_dtype,
@@ -211,7 +212,7 @@ class DataFrame(Frame, Serializable):
             else:
                 self._index = as_index(index)
             if columns is not None:
-                if isinstance(columns, (cudf.Series, cudf.Index)):
+                if isinstance(columns, (Series, cudf.Index)):
                     columns = columns.to_pandas()
 
                 self._data = ColumnAccessor(
@@ -260,7 +261,7 @@ class DataFrame(Frame, Serializable):
                     self._data = new_df._data
                     self._index = new_df._index
                     self.columns = new_df.columns
-                elif len(data) > 0 and isinstance(data[0], cudf.Series):
+                elif len(data) > 0 and isinstance(data[0], Series):
                     self._init_from_series_list(
                         data=data, columns=columns, index=index
                     )
@@ -374,7 +375,7 @@ class DataFrame(Frame, Serializable):
                     self._data[col_name] = column.column_empty(
                         row_count=len(self), dtype=None, masked=True
                     )
-            self._data = self._data.get_by_label(columns)
+            self._data = self._data.select_by_label(columns)
 
     def _init_from_list_like(self, data, index=None, columns=None):
         if index is None:
@@ -464,9 +465,9 @@ class DataFrame(Frame, Serializable):
         data = data.copy()
 
         input_series = [
-            cudf.Series(val)
+            Series(val)
             for val in data.values()
-            if isinstance(val, (pd.Series, cudf.Series))
+            if isinstance(val, (pd.Series, Series))
         ]
 
         if input_series:
@@ -483,7 +484,7 @@ class DataFrame(Frame, Serializable):
                 index = aligned_input_series[0].index
 
             for name, val in data.items():
-                if isinstance(val, (pd.Series, cudf.Series)):
+                if isinstance(val, (pd.Series, Series)):
                     data[name] = aligned_input_series.pop(0)
 
         return data, index
@@ -840,6 +841,7 @@ class DataFrame(Frame, Serializable):
         sizes = [col._memory_usage(deep=deep) for col in self._data.columns]
         if index:
             ind.append("Index")
+            ind = cudf.Index(ind, dtype="str")
             sizes.append(self.index.memory_usage(deep=deep))
         return Series(sizes, index=ind)
 
@@ -1118,14 +1120,30 @@ class DataFrame(Frame, Serializable):
 
     def _clean_renderable_dataframe(self, output):
         """
-        the below is permissible: null in a datetime to_pandas() becomes
-        NaT, which is then replaced with null in this processing step.
-        It is not possible to have a mix of nulls and NaTs in datetime
-        columns because we do not support NaT - pyarrow as_column
-        preprocessing converts NaT input values from numpy or pandas into
-        null.
+        This method takes in partial/preprocessed dataframe
+        and returns correct representation of it with correct
+        dimensions (rows x columns)
         """
-        output = output.to_pandas().__repr__().replace(" NaT", "null")
+
+        max_rows = get_option("display.max_rows")
+        min_rows = get_option("display.min_rows")
+        max_cols = get_option("display.max_columns")
+        max_colwidth = get_option("display.max_colwidth")
+        show_dimensions = get_option("display.show_dimensions")
+        if get_option("display.expand_frame_repr"):
+            width, _ = console.get_console_size()
+        else:
+            width = None
+
+        output = output.to_pandas().to_string(
+            max_rows=max_rows,
+            min_rows=min_rows,
+            max_cols=max_cols,
+            line_width=width,
+            max_colwidth=max_colwidth,
+            show_dimensions=show_dimensions,
+        )
+
         lines = output.split("\n")
 
         if lines[-1].startswith("["):
@@ -1135,6 +1153,26 @@ class DataFrame(Frame, Serializable):
             )
         return "\n".join(lines)
 
+    def _clean_nulls_from_dataframe(self, df):
+        """
+        This function converts all ``null`` values to ``<NA>`` for
+        representation as a string in `__repr__`.
+
+        Since we utilize Pandas `__repr__` at all places in our code
+        for formatting purposes, we convert columns to `str` dtype for
+        filling with `<NA>` values.
+        """
+        for col in df._data:
+            if is_list_dtype(df._data[col]):
+                # TODO we need to handle this
+                pass
+            elif df._data[col].has_nulls:
+                df[col] = df._data[col].astype("str").fillna(cudf._NA_REP)
+            else:
+                df[col] = df._data[col]
+
+        return df
+
     def _get_renderable_dataframe(self):
         """
         takes rows and columns from pandas settings or estimation from size.
@@ -1142,7 +1180,8 @@ class DataFrame(Frame, Serializable):
         multiindex as well producing an efficient representative string
         for printing with the dataframe.
         """
-        nrows = np.max([pd.options.display.max_rows, 1])
+        max_rows = pd.options.display.max_rows
+        nrows = np.max([len(self) if max_rows is None else max_rows, 1])
         if pd.options.display.max_rows == 0:
             nrows = len(self)
         ncols = (
@@ -1153,6 +1192,24 @@ class DataFrame(Frame, Serializable):
 
         if len(self) <= nrows and len(self._data.names) <= ncols:
             output = self.copy(deep=False)
+        elif self.empty and len(self.index) > 0:
+            max_seq_items = pd.options.display.max_seq_items
+            # Incase of Empty DataFrame with index, Pandas prints
+            # first `pd.options.display.max_seq_items` index values
+            # followed by ... To obtain ... at the end of index list,
+            # adding 1 extra value.
+            # If `pd.options.display.max_seq_items` is None,
+            # entire sequence/Index is to be printed.
+            # Note : Pandas truncates the dimensions at the end of
+            # the resulting dataframe when `display.show_dimensions`
+            # is set to truncate. Hence to display the dimentions we
+            # need to extract maximum of `max_seq_items` and `nrows`
+            # and have 1 extra value for ... to show up in the output
+            # string.
+            if max_seq_items is not None:
+                output = self.head(max(max_seq_items, nrows) + 1)
+            else:
+                output = self.copy(deep=False)
         else:
             left_cols = len(self._data.names)
             right_cols = 0
@@ -1192,15 +1249,8 @@ class DataFrame(Frame, Serializable):
             lower = cudf.concat([lower_left, lower_right], axis=1)
             output = cudf.concat([upper, lower])
 
-        for col in output._data:
-            if (
-                self._data[col].has_nulls
-                and not self._data[col].dtype == "O"
-                and not is_datetime_dtype(self._data[col].dtype)
-            ):
-                output[col] = output._data[col].astype("str").fillna("null")
-            else:
-                output[col] = output._data[col]
+        output = self._clean_nulls_from_dataframe(output)
+        output._index = output._index._clean_nulls_from_index()
 
         return output
 
@@ -2416,7 +2466,7 @@ class DataFrame(Frame, Serializable):
         is_multiindex = isinstance(columns, pd.MultiIndex)
 
         if isinstance(
-            columns, (cudf.Series, cudf.Index, cudf.core.column.ColumnBase)
+            columns, (Series, cudf.Index, cudf.core.column.ColumnBase)
         ):
             columns = pd.Index(columns.to_array(), tupleize_cols=is_multiindex)
         elif not isinstance(columns, pd.Index):
@@ -2556,7 +2606,7 @@ class DataFrame(Frame, Serializable):
             else:
                 df = DataFrame(None, idx).join(df, how="left", sort=True)
                 # double-argsort to map back from sorted to unsorted positions
-                df = df.take(idx.argsort(True).argsort())
+                df = df.take(idx.argsort(ascending=True).argsort())
 
         idx = idx if idx is not None else df.index
         names = cols if cols is not None else list(df.columns)
@@ -2595,7 +2645,7 @@ class DataFrame(Frame, Serializable):
             if len(index) > 1:
                 df = self.copy(deep=False)
                 if drop:
-                    df = df.drop(columns=index)
+                    df = df.drop(columns=index, axis=1)
                 return df.set_index(
                     cudf.MultiIndex.from_frame(self[index], names=index)
                 )
@@ -2757,7 +2807,7 @@ class DataFrame(Frame, Serializable):
     def __copy__(self):
         return self.copy(deep=True)
 
-    def __deepcopy__(self, memo={}):
+    def __deepcopy__(self, memo=None):
         """
         Parameters
         ----------
@@ -2847,96 +2897,201 @@ class DataFrame(Frame, Serializable):
     def drop(
         self,
         labels=None,
-        axis=None,
+        axis=0,
+        index=None,
         columns=None,
-        errors="raise",
+        level=None,
         inplace=False,
+        errors="raise",
     ):
-        """Drop column(s)
+        """
+        Drop specified labels from rows or columns.
+
+        Remove rows or columns by specifying label names and corresponding
+        axis, or by specifying directly index or column names. When using a
+        multi-index, labels on different levels can be removed by specifying
+        the level.
 
         Parameters
         ----------
-        labels : str or sequence of strings
-            Name of column(s) to be dropped.
+        labels : single label or list-like
+            Index or column labels to drop.
         axis : {0 or 'index', 1 or 'columns'}, default 0
-            Only axis=1 is currently supported.
-        columns
-            array of column names, the same as using labels and axis=1
-        errors : {'ignore', 'raise'}, default 'raise'
-            This parameter is currently ignored.
+            Whether to drop labels from the index (0 or 'index') or
+            columns (1 or 'columns').
+        index : single label or list-like
+            Alternative to specifying axis (``labels, axis=0``
+            is equivalent to ``index=labels``).
+        columns : single label or list-like
+            Alternative to specifying axis (``labels, axis=1``
+            is equivalent to ``columns=labels``).
+        level : int or level name, optional
+            For MultiIndex, level from which the labels will be removed.
         inplace : bool, default False
-            If True, do operation inplace and return `self`.
+            If False, return a copy. Otherwise, do operation
+            inplace and return None.
+        errors : {'ignore', 'raise'}, default 'raise'
+            If 'ignore', suppress error and only existing labels are
+            dropped.
 
         Returns
         -------
-        A dataframe without dropped column(s)
+        DataFrame
+            DataFrame without the removed index or column labels.
+
+        Raises
+        ------
+        KeyError
+            If any of the labels is not found in the selected axis.
+
+        See Also
+        --------
+        DataFrame.loc : Label-location based indexer for selection by label.
+        DataFrame.dropna : Return DataFrame with labels on given axis omitted
+            where (all or any) data are missing.
+        DataFrame.drop_duplicates : Return DataFrame with duplicate rows
+            removed, optionally only considering certain columns.
 
         Examples
         --------
         >>> import cudf
-        >>> df = cudf.DataFrame()
-        >>> df['key'] = [0, 1, 2, 3, 4]
-        >>> df['val'] = [float(i + 10) for i in range(5)]
-        >>> df_new = df.drop('val')
-        >>> print(df)
-           key   val
-        0    0  10.0
-        1    1  11.0
-        2    2  12.0
-        3    3  13.0
-        4    4  14.0
-        >>> print(df_new)
-           key
-        0    0
-        1    1
-        2    2
-        3    3
-        4    4
+        >>> df = cudf.DataFrame({"A": [1, 2, 3, 4],
+        ...                      "B": [5, 6, 7, 8],
+        ...                      "C": [10, 11, 12, 13],
+        ...                      "D": [20, 30, 40, 50]})
+        >>> df
+           A  B   C   D
+        0  1  5  10  20
+        1  2  6  11  30
+        2  3  7  12  40
+        3  4  8  13  50
+
+        Drop columns
+
+        >>> df.drop(['B', 'C'], axis=1)
+           A   D
+        0  1  20
+        1  2  30
+        2  3  40
+        3  4  50
+        >>> df.drop(columns=['B', 'C'])
+           A   D
+        0  1  20
+        1  2  30
+        2  3  40
+        3  4  50
+
+        Drop a row by index
+
+        >>> df.drop([0, 1])
+           A  B   C   D
+        2  3  7  12  40
+        3  4  8  13  50
+
+        Drop columns and/or rows of MultiIndex DataFrame
+
+        >>> midx = cudf.MultiIndex(levels=[['lama', 'cow', 'falcon'],
+        ...                              ['speed', 'weight', 'length']],
+        ...                      codes=[[0, 0, 0, 1, 1, 1, 2, 2, 2],
+        ...                             [0, 1, 2, 0, 1, 2, 0, 1, 2]])
+        >>> df = cudf.DataFrame(index=midx, columns=['big', 'small'],
+        ...                   data=[[45, 30], [200, 100], [1.5, 1], [30, 20],
+        ...                         [250, 150], [1.5, 0.8], [320, 250],
+        ...                         [1, 0.8], [0.3, 0.2]])
+        >>> df
+                         big  small
+        lama   speed    45.0   30.0
+               weight  200.0  100.0
+               length    1.5    1.0
+        cow    speed    30.0   20.0
+               weight  250.0  150.0
+               length    1.5    0.8
+        falcon speed   320.0  250.0
+               weight    1.0    0.8
+               length    0.3    0.2
+        >>> df.drop(index='cow', columns='small')
+                         big
+        lama   speed    45.0
+               weight  200.0
+               length    1.5
+        falcon speed   320.0
+               weight    1.0
+               length    0.3
+        >>> df.drop(index='length', level=1)
+                         big  small
+        lama   speed    45.0   30.0
+               weight  200.0  100.0
+        cow    speed    30.0   20.0
+               weight  250.0  150.0
+        falcon speed   320.0  250.0
+               weight    1.0    0.8
         """
-        if axis == 0 and labels is not None:
-            raise NotImplementedError("Can only drop columns, not rows")
-        if errors != "raise":
-            raise NotImplementedError("errors= keyword not implemented")
-        if labels is None and columns is None:
-            raise ValueError(
-                "Need to specify at least one of 'labels' or 'columns'"
-            )
-        if labels is not None and columns is not None:
-            raise ValueError("Cannot specify both 'labels' and 'columns'")
 
         if labels is not None:
+            if index is not None or columns is not None:
+                raise ValueError(
+                    "Cannot specify both 'labels' and 'index'/'columns'"
+                )
             target = labels
-        else:
+        elif index is not None:
+            target = index
+            axis = 0
+        elif columns is not None:
             target = columns
+            axis = 1
+        else:
+            raise ValueError(
+                "Need to specify at least one of 'labels', "
+                "'index' or 'columns'"
+            )
 
-        columns = (
-            [target]
-            if isinstance(target, (str, numbers.Number))
-            else list(set(target))
-        )
         if inplace:
             outdf = self
         else:
             outdf = self.copy()
-        for c in columns:
-            outdf._drop_column(c)
-        return outdf
 
-    def drop_column(self, name):
-        """Drop a column by *name*
-        """
-        warnings.warn(
-            "The drop_column method is deprecated. "
-            "Use the drop method instead.",
-            DeprecationWarning,
-        )
-        self._drop_column(name)
+        if axis in (1, "columns"):
+            target = _get_host_unique(target)
+
+            _drop_columns(outdf, target, errors)
+        elif axis in (0, "index"):
+            if not isinstance(target, (cudf.Series, cudf.Index)):
+                target = column.as_column(target)
+
+            if isinstance(self._index, cudf.MultiIndex):
+                if level is None:
+                    level = 0
+
+                levels_index = outdf.index.get_level_values(level)
+                if errors == "raise" and not target.isin(levels_index).all():
+                    raise KeyError("One or more values not found in axis")
+
+                # TODO : Could use anti-join as a future optimization
+                sliced_df = outdf.take(~levels_index.isin(target))
+                sliced_df._index.names = self._index.names
+            else:
+                if errors == "raise" and not target.isin(outdf.index).all():
+                    raise KeyError("One or more values not found in axis")
+
+                sliced_df = outdf.join(
+                    cudf.DataFrame(index=target), how="leftanti"
+                )
+
+            if columns is not None:
+                columns = _get_host_unique(columns)
+                _drop_columns(sliced_df, columns, errors)
+
+            outdf._data = sliced_df._data
+            outdf._index = sliced_df._index
+
+        if not inplace:
+            return outdf
 
     def _drop_column(self, name):
         """Drop a column by *name*
         """
         if name not in self._data:
-            raise NameError("column {!r} does not exist".format(name))
+            raise KeyError("column {!r} does not exist".format(name))
         del self._data[name]
 
     def drop_duplicates(
@@ -4373,7 +4528,7 @@ class DataFrame(Frame, Serializable):
                 column_head, space
             )
             if show_counts:
-                counts = self.count().tolist()
+                counts = self.count().to_pandas().tolist()
                 if len(cols) != len(counts):
                     raise AssertionError(
                         f"Columns must equal "
@@ -4480,183 +4635,66 @@ class DataFrame(Frame, Serializable):
 
         cudf.utils.ioutils.buffer_write_lines(buf, lines)
 
-    def fillna(self, value, method=None, axis=None, inplace=False, limit=None):
-        """Fill null values with ``value``.
-
-        Parameters
-        ----------
-        value : scalar, Series-like or dict
-            Value to use to fill nulls. If Series-like, null values
-            are filled with values in corresponding indices.
-            A dict can be used to provide different values to fill nulls
-            in different columns.
-
-        Returns
-        -------
-        result : DataFrame
-            Copy with nulls filled.
-
-        Examples
-        --------
-        >>> import cudf
-        >>> gdf = cudf.DataFrame({'a': [1, 2, None], 'b': [3, None, 5]})
-        >>> gdf.fillna(4).to_pandas()
-        a  b
-        0  1  3
-        1  2  4
-        2  4  5
-        >>> gdf.fillna({'a': 3, 'b': 4}).to_pandas()
-        a  b
-        0  1  3
-        1  2  4
-        2  3  5
-        """
-        if inplace:
-            outdf = {}  # this dict will just hold Nones
-        else:
-            outdf = self.copy()
-
-        if not is_dict_like(value):
-            value = dict.fromkeys(self.columns, value)
-
-        for k in value:
-            outdf[k] = self[k].fillna(
-                value[k],
-                method=method,
-                axis=axis,
-                inplace=inplace,
-                limit=limit,
-            )
-
-        if not inplace:
-            return outdf
-
-    def describe(self, percentiles=None, include=None, exclude=None):
-        """Compute summary statistics of a DataFrame's columns. For numeric
-        data, the output includes the minimum, maximum, mean, median,
-        standard deviation, and various quantiles. For object data, the output
-        includes the count, number of unique values, the most common value, and
-        the number of occurrences of the most common value.
-
-        Parameters
-        ----------
-        percentiles : list-like, optional
-            The percentiles used to generate the output summary statistics.
-            If None, the default percentiles used are the 25th, 50th and 75th.
-            Values should be within the interval [0, 1].
-
-        include: str, list-like, optional
-            The dtypes to be included in the output summary statistics. Columns
-            of dtypes not included in this list will not be part of the output.
-            If include='all', all dtypes are included. Default of None includes
-            all numeric columns.
-
-        exclude: str, list-like, optional
-            The dtypes to be excluded from the output summary statistics.
-            Columns of dtypes included in this list will not be part of the
-            output. Default of None excludes no columns.
-
-        Returns
-        -------
-        output_frame : DataFrame
-            Summary statistics of relevant columns in the original dataframe.
-
-        Examples
-        --------
-        Describing a ``Series`` containing numeric values.
-
-        >>> import cudf
-        >>> s = cudf.Series([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
-        >>> print(s.describe())
-           stats   values
-        0  count     10.0
-        1   mean      5.5
-        2    std  3.02765
-        3    min      1.0
-        4    25%      2.5
-        5    50%      5.5
-        6    75%      7.5
-        7    max     10.0
-
-        Describing a ``DataFrame``. By default all numeric fields
-        are returned.
-
-        >>> gdf = cudf.DataFrame()
-        >>> gdf['a'] = [1,2,3]
-        >>> gdf['b'] = [1.0, 2.0, 3.0]
-        >>> gdf['c'] = ['x', 'y', 'z']
-        >>> gdf['d'] = [1.0, 2.0, 3.0]
-        >>> gdf['d'] = gdf['d'].astype('float32')
-        >>> print(gdf.describe())
-           stats    a    b    d
-        0  count  3.0  3.0  3.0
-        1   mean  2.0  2.0  2.0
-        2    std  1.0  1.0  1.0
-        3    min  1.0  1.0  1.0
-        4    25%  1.5  1.5  1.5
-        5    50%  1.5  1.5  1.5
-        6    75%  2.5  2.5  2.5
-        7    max  3.0  3.0  3.0
-
-        Using the ``include`` keyword to describe only specific dtypes.
-
-        >>> gdf = cudf.DataFrame()
-        >>> gdf['a'] = [1,2,3]
-        >>> gdf['b'] = [1.0, 2.0, 3.0]
-        >>> gdf['c'] = ['x', 'y', 'z']
-        >>> print(gdf.describe(include='int'))
-           stats    a
-        0  count  3.0
-        1   mean  2.0
-        2    std  1.0
-        3    min  1.0
-        4    25%  1.5
-        5    50%  1.5
-        6    75%  2.5
-        7    max  3.0
-        """
-
-        def _create_output_frame(data, percentiles=None):
-            # hack because we don't support strings in indexes
-            return DataFrame(
-                {
-                    col: data[col].describe(percentiles=percentiles)
-                    for col in data.columns
-                },
-                index=Series(column.column_empty(0, dtype="int32"))
-                .describe(percentiles=percentiles)
-                .index,
-            )
+    @docutils.doc_describe()
+    def describe(
+        self,
+        percentiles=None,
+        include=None,
+        exclude=None,
+        datetime_is_numeric=False,
+    ):
+        """{docstring}"""
 
         if not include and not exclude:
-            numeric_data = self.select_dtypes(np.number)
-            output_frame = _create_output_frame(numeric_data, percentiles)
+            default_include = [np.number]
+            if datetime_is_numeric:
+                default_include.append("datetime")
+            data_to_describe = self.select_dtypes(include=default_include)
+            if len(data_to_describe.columns) == 0:
+                data_to_describe = self
 
         elif include == "all":
-            if exclude:
-                raise ValueError("Cannot exclude when include='all'.")
+            if exclude is not None:
+                raise ValueError("exclude must be None when include is 'all'")
 
-            included_data = self.select_dtypes(np.number)
-            output_frame = _create_output_frame(included_data, percentiles)
-            logging.warning(
-                "Describe does not yet include StringColumns or "
-                "DatetimeColumns."
-            )
-
+            data_to_describe = self
         else:
-            if not include:
-                include = np.number
-
-            included_data = self.select_dtypes(
+            data_to_describe = self.select_dtypes(
                 include=include, exclude=exclude
             )
-            if included_data.empty:
+
+            if data_to_describe.empty:
                 raise ValueError("No data of included types.")
-            output_frame = _create_output_frame(included_data, percentiles)
 
-        return output_frame
+        describe_series_list = [
+            data_to_describe[col].describe(percentiles=percentiles)
+            for col in data_to_describe.columns
+        ]
+        if len(describe_series_list) == 1:
+            return describe_series_list[0].to_frame()
+        else:
+            ldesc_indexes = sorted(
+                (x.index for x in describe_series_list), key=len
+            )
+            names = OrderedDict.fromkeys(
+                [
+                    name
+                    for idxnames in ldesc_indexes
+                    for name in idxnames.to_pandas()
+                ],
+                None,
+            )
 
-    def to_pandas(self):
+            return cudf.concat(
+                [
+                    series.reindex(names, copy=False)
+                    for series in describe_series_list
+                ],
+                axis=1,
+                sort=False,
+            )
+
+    def to_pandas(self, **kwargs):
         """
         Convert to a Pandas DataFrame.
 
@@ -4673,6 +4711,7 @@ class DataFrame(Frame, Serializable):
         >>> type(pdf)
         <class 'pandas.core.frame.DataFrame'>
         """
+
         out_data = {}
         out_index = self.index.to_pandas()
 
@@ -4765,75 +4804,10 @@ class DataFrame(Frame, Serializable):
 
         return result
 
-    def to_arrow(self, preserve_index=True):
-        """
-        Convert to a PyArrow Table.
-
-        Examples
-        --------
-        >>> import cudf
-        >>> a = ('a', [0, 1, 2])
-        >>> b = ('b', [-3, 2, 0])
-        >>> df = cudf.DataFrame([a, b])
-        >>> df.to_arrow()
-        pyarrow.Table
-        None: int64
-        a: int64
-        b: int64
-        """
-        arrays = []
-        names = []
-        types = []
-        index_names = []
-        index_columns = []
-        index_descriptors = []
-
-        for name, col in self._data.items():
-            names.append(name)
-            arrow_col = col.to_arrow()
-            arrays.append(arrow_col)
-            types.append(arrow_col.type)
-
-        index_name = pa.pandas_compat._index_level_name(self.index, 0, names)
-        index_columns.append(self.index)
-
-        # It would be better if we didn't convert this if we didn't have to,
-        # but we first need better tooling for cudf --> pyarrow type
-        # conversions
-        if preserve_index:
-            if isinstance(self.index, cudf.core.index.RangeIndex):
-                descr = {
-                    "kind": "range",
-                    "name": self.index.name,
-                    "start": self.index._start,
-                    "stop": self.index._stop,
-                    "step": 1,
-                }
-            else:
-                index_arrow = self.index.to_arrow()
-                descr = index_name
-                types.append(index_arrow.type)
-                arrays.append(index_arrow)
-                names.append(index_name)
-                index_names.append(index_name)
-            index_descriptors.append(descr)
-
-        # We may want to add additional metadata to this in the future, but
-        # for now lets just piggyback off of what's done for Pandas
-        metadata = pa.pandas_compat.construct_metadata(
-            self,
-            names,
-            index_columns,
-            index_descriptors,
-            preserve_index,
-            types,
-        )
-
-        return pa.Table.from_arrays(arrays, names=names, metadata=metadata)
-
     @classmethod
     def from_arrow(cls, table):
-        """Convert from a PyArrow Table.
+        """
+        Convert from PyArrow Table to DataFrame.
 
         Parameters
         ----------
@@ -4844,69 +4818,120 @@ class DataFrame(Frame, Serializable):
         ------
         TypeError for invalid input type.
 
+        Returns
+        -------
+        cudf DataFrame
+
         Notes
         -----
-
         -   Does not support automatically setting index column(s) similar
             to how ``to_pandas`` works for PyArrow Tables.
 
         Examples
         --------
-        >>> import pyarrow as pa
         >>> import cudf
-        >>> data = [pa.array([1, 2, 3]), pa.array([4, 5, 6])]
-        >>> batch = pa.RecordBatch.from_arrays(data, ['f0', 'f1'])
-        >>> table = pa.Table.from_batches([batch])
-        >>> cudf.DataFrame.from_arrow(table)
-            f0  f1
-        0   1   4
-        1   2   5
-        2   3   6
+        >>> import pyarrow as pa
+        >>> data = pa.table({"a":[1, 2, 3], "b":[4, 5, 6]})
+        >>> cudf.DataFrame.from_arrow(data)
+           a  b
+        0  1  4
+        1  2  5
+        2  3  6
         """
-
-        if not isinstance(table, pa.Table):
-            raise TypeError("not a pyarrow.Table")
-
         index_col = None
-        dtypes = None
-        if isinstance(table.schema.pandas_metadata, dict):
-            metadata = table.schema.pandas_metadata
-            index_col = metadata["index_columns"]
-            dtypes = {
-                col["field_name"]: col["pandas_type"]
-                for col in metadata["columns"]
-                if "field_name" in col
-            }
+        if isinstance(table, pa.Table) and isinstance(
+            table.schema.pandas_metadata, dict
+        ):
+            index_col = table.schema.pandas_metadata["index_columns"]
 
-        df = cls()
-        for name, col in zip(table.schema.names, table.columns):
-            if dtypes:
-                dtype = dtypes[name]
-                if dtype == "categorical":
-                    dtype = "category"
-                elif dtype == "date":
-                    dtype = "datetime64[ms]"
-            else:
-                dtype = None
+        out = super().from_arrow(table)
 
-            df[name] = column.as_column(col, dtype=dtype)
         if index_col:
             if isinstance(index_col[0], dict):
-                assert index_col[0]["kind"] == "range"
-                df = df.set_index(
-                    RangeIndex(
+                out = out.set_index(
+                    cudf.RangeIndex(
                         index_col[0]["start"],
                         index_col[0]["stop"],
                         name=index_col[0]["name"],
                     )
                 )
             else:
-                df = df.set_index(index_col[0])
-                new_index_name = pa.pandas_compat._backwards_compatible_index_name(  # noqa: E501
-                    df.index.name, df.index.name
-                )
-                df.index.name = new_index_name
-        return df
+                out = out.set_index(index_col[0])
+
+        return out
+
+    def to_arrow(self, preserve_index=True):
+        """
+        Convert to a PyArrow Table.
+
+        Parameters
+        ----------
+        preserve_index : bool, default True
+            whether index column and its meta data needs to be saved or not
+
+        Returns
+        -------
+        PyArrow Table
+
+        Examples
+        --------
+        >>> import cudf
+        >>> df = cudf.DataFrame(
+        ...     {"a":[1, 2, 3], "b":[4, 5, 6]}, index=[1, 2, 3])
+        >>> df.to_arrow()
+        pyarrow.Table
+        a: int64
+        b: int64
+        index: int64
+        >>> df.to_arrow(preserve_index=False)
+        pyarrow.Table
+        a: int64
+        b: int64
+        """
+
+        data = self.copy(deep=False)
+        index_descr = []
+        if preserve_index:
+            if isinstance(self.index, cudf.RangeIndex):
+                descr = {
+                    "kind": "range",
+                    "name": self.index.name,
+                    "start": self.index._start,
+                    "stop": self.index._stop,
+                    "step": 1,
+                }
+            else:
+                if isinstance(self.index, cudf.MultiIndex):
+                    gen_names = tuple(
+                        f"level_{i}"
+                        for i, _ in enumerate(self.index._data.names)
+                    )
+                else:
+                    gen_names = (
+                        self.index.names
+                        if self.index.name is not None
+                        else ("index",)
+                    )
+                for gen_name, col_name in zip(
+                    gen_names, self.index._data.names
+                ):
+                    data.insert(
+                        data.shape[1], gen_name, self.index._data[col_name]
+                    )
+                descr = gen_names[0]
+            index_descr.append(descr)
+
+        out = super(DataFrame, data).to_arrow()
+        metadata = pa.pandas_compat.construct_metadata(
+            self,
+            out.schema.names,
+            [self.index],
+            index_descr,
+            preserve_index,
+            types=out.schema.types,
+        )
+
+        return out.replace_schema_metadata(metadata)
 
     def to_records(self, index=True):
         """Convert to a numpy recarray
@@ -5140,7 +5165,7 @@ class DataFrame(Frame, Serializable):
         if columns is not None:
             data = dict(zip(columns, cols))
         else:
-            data = dict(zip(range(len(cols)), cols))
+            data = dict(enumerate(cols))
 
         return cls(data=data, index=index,)
 
@@ -5284,8 +5309,8 @@ class DataFrame(Frame, Serializable):
                     val = values[col]
                     result_df[col] = self._data[col].isin(val)
                 else:
-                    result_df[col] = utils.scalar_broadcast_to(
-                        False, len(self)
+                    result_df[col] = column.full(
+                        size=len(self), fill_value=False, dtype="bool"
                     )
 
             result_df.index = self.index
@@ -5357,10 +5382,6 @@ class DataFrame(Frame, Serializable):
     def _prepare_for_rowwise_op(self):
         """Prepare a DataFrame for CuPy-based row-wise operations.
         """
-        warnings.warn(
-            "Row-wise operations currently only support int, float, "
-            "and bool dtypes."
-        )
 
         if any([col.nullable for col in self._columns]):
             msg = (
@@ -5372,6 +5393,12 @@ class DataFrame(Frame, Serializable):
 
         filtered = self.select_dtypes(include=[np.number, np.bool])
         common_dtype = np.find_common_type(filtered.dtypes, [])
+        if filtered._num_columns < self._num_columns:
+            msg = (
+                "Row-wise operations currently only support int, float "
+                "and bool dtypes. Non numeric columns are ignored."
+            )
+            warnings.warn(msg)
         coerced = filtered.astype(common_dtype)
         return coerced
 
@@ -5413,25 +5440,23 @@ class DataFrame(Frame, Serializable):
         )
 
     def min(
-        self,
-        axis=None,
-        skipna=None,
-        dtype=None,
-        level=None,
-        numeric_only=None,
-        **kwargs,
+        self, axis=None, skipna=None, level=None, numeric_only=None, **kwargs,
     ):
         """
         Return the minimum of the values in the DataFrame.
 
         Parameters
         ----------
-
+        axis: {index (0), columns(1)}
+            Axis for the function to be applied on.
         skipna: bool, default True
             Exclude NA/null values when computing the result.
-
-        dtype: data type
-            Data type to cast the result to.
+        level: int or level name, default None
+            If the axis is a MultiIndex (hierarchical), count along a
+            particular level, collapsing into a Series.
+        numeric_only: bool, default None
+            Include only float, int, boolean columns. If None, will attempt to
+            use everything, then use only numeric data.
 
         Returns
         -------
@@ -5454,32 +5479,29 @@ class DataFrame(Frame, Serializable):
             "min",
             axis=axis,
             skipna=skipna,
-            dtype=dtype,
             level=level,
             numeric_only=numeric_only,
             **kwargs,
         )
 
     def max(
-        self,
-        axis=None,
-        skipna=None,
-        dtype=None,
-        level=None,
-        numeric_only=None,
-        **kwargs,
+        self, axis=None, skipna=None, level=None, numeric_only=None, **kwargs,
     ):
         """
         Return the maximum of the values in the DataFrame.
 
         Parameters
         ----------
-
+        axis: {index (0), columns(1)}
+            Axis for the function to be applied on.
         skipna: bool, default True
             Exclude NA/null values when computing the result.
-
-        dtype: data type
-            Data type to cast the result to.
+        level: int or level name, default None
+            If the axis is a MultiIndex (hierarchical), count along a
+            particular level, collapsing into a Series.
+        numeric_only: bool, default None
+            Include only float, int, boolean columns. If None, will attempt to
+            use everything, then use only numeric data.
 
         Returns
         -------
@@ -5502,7 +5524,6 @@ class DataFrame(Frame, Serializable):
             "max",
             axis=axis,
             skipna=skipna,
-            dtype=dtype,
             level=level,
             numeric_only=numeric_only,
             **kwargs,
@@ -5861,6 +5882,106 @@ class DataFrame(Frame, Serializable):
             numeric_only=numeric_only,
             **kwargs,
         )
+
+    def mode(self, axis=0, numeric_only=False, dropna=True):
+        """
+        Get the mode(s) of each element along the selected axis.
+
+        The mode of a set of values is the value that appears most often.
+        It can be multiple values.
+
+        Parameters
+        ----------
+        axis : {0 or 'index', 1 or 'columns'}, default 0
+            The axis to iterate over while searching for the mode:
+
+            - 0 or 'index' : get mode of each column
+            - 1 or 'columns' : get mode of each row.
+        numeric_only : bool, default False
+            If True, only apply to numeric columns.
+        dropna : bool, default True
+            Don't consider counts of NA/NaN/NaT.
+
+        Returns
+        -------
+        DataFrame
+            The modes of each column or row.
+
+        See Also
+        --------
+        cudf.core.series.Series.mode : Return the highest frequency value
+            in a Series.
+        cudf.core.series.Series.value_counts : Return the counts of values
+            in a Series.
+
+        Notes
+        -----
+        ``axis`` parameter is currently not supported.
+
+        Examples
+        --------
+        >>> import cudf
+        >>> df = cudf.DataFrame({
+        ...     "species": ["bird", "mammal", "arthropod", "bird"],
+        ...     "legs": [2, 4, 8, 2],
+        ...     "wings": [2.0, None, 0.0, None]
+        ... })
+        >>> df
+             species  legs wings
+        0       bird     2   2.0
+        1     mammal     4  <NA>
+        2  arthropod     8   0.0
+        3       bird     2  <NA>
+
+        By default, missing values are not considered, and the mode of wings
+        are both 0 and 2. The second row of species and legs contains ``NA``,
+        because they have only one mode, but the DataFrame has two rows.
+
+        >>> df.mode()
+          species  legs  wings
+        0    bird     2    0.0
+        1    <NA>  <NA>    2.0
+
+        Setting ``dropna=False``, ``NA`` values are considered and they can be
+        the mode (like for wings).
+
+        >>> df.mode(dropna=False)
+          species  legs wings
+        0    bird     2  <NA>
+
+        Setting ``numeric_only=True``, only the mode of numeric columns is
+        computed, and columns of other types are ignored.
+
+        >>> df.mode(numeric_only=True)
+           legs  wings
+        0     2    0.0
+        1  <NA>    2.0
+        """
+        if axis not in (0, "index"):
+            raise NotImplementedError("Only axis=0 is currently supported")
+
+        if numeric_only:
+            data_df = self.select_dtypes(
+                include=[np.number], exclude=["datetime64", "timedelta64"]
+            )
+        else:
+            data_df = self
+
+        mode_results = [
+            data_df[col].mode(dropna=dropna) for col in data_df._data
+        ]
+
+        if len(mode_results) == 0:
+            df = DataFrame(index=self.index)
+            return df
+
+        df = cudf.concat(mode_results, axis=1)
+        if isinstance(df, Series):
+            df = df.to_frame()
+
+        df.columns = data_df.columns
+
+        return df
 
     def std(
         self,
@@ -6526,9 +6647,56 @@ class DataFrame(Frame, Serializable):
 
     def to_dict(self, orient="dict", into=dict):
         raise TypeError(
-            "Implicit conversion to a host memory via to_dict() is not "
-            "allowed, To explicitly construct a dictionary object, "
-            "consider using .to_pandas().to_dict()"
+            "cuDF does not support conversion to host memory "
+            "via `to_dict()` method. Consider using "
+            "`.to_pandas().to_dict()` to construct a Python dictionary."
+        )
+
+    def keys(self):
+        """
+        Get the columns.
+        This is index for Series, columns for DataFrame.
+
+        Returns
+        -------
+        Index
+            Columns of DataFrame.
+
+        Examples
+        --------
+        >>> import cudf
+        >>> df = cudf.DataFrame({'one' : [1, 2, 3], 'five' : ['a', 'b', 'c']})
+        >>> df
+           one five
+        0    1    a
+        1    2    b
+        2    3    c
+        >>> df.keys()
+        Index(['one', 'five'], dtype='object')
+        >>> df = cudf.DataFrame(columns=[0, 1, 2, 3])
+        >>> df
+        Empty DataFrame
+        Columns: [0, 1, 2, 3]
+        Index: []
+        >>> df.keys()
+        Int64Index([0, 1, 2, 3], dtype='int64')
+        """
+        return self.columns
+
+    def itertuples(self, index=True, name="Pandas"):
+        raise TypeError(
+            "cuDF does not support iteration of DataFrame "
+            "via itertuples. Consider using "
+            "`.to_pandas().itertuples()` "
+            "if you wish to iterate over namedtuples."
+        )
+
+    def iterrows(self):
+        raise TypeError(
+            "cuDF does not support iteration of DataFrame "
+            "via iterrows. Consider using "
+            "`.to_pandas().iterrows()` "
+            "if you wish to iterate over each row."
         )
 
     def append(
@@ -6556,7 +6724,7 @@ class DataFrame(Frame, Serializable):
 
         See Also
         --------
-        cudf.concat : General function to concatenate DataFrame or
+        cudf.core.reshape.concat : General function to concatenate DataFrame or
             objects.
 
         Notes
@@ -6638,7 +6806,7 @@ class DataFrame(Frame, Serializable):
                 [self, other], ignore_index=ignore_index, sort=sort
             )
             return result
-        elif isinstance(other, cudf.Series):
+        elif isinstance(other, Series):
             if other.name is None and not ignore_index:
                 raise TypeError(
                     "Can only append a Series if ignore_index=True "
@@ -6647,7 +6815,17 @@ class DataFrame(Frame, Serializable):
 
             current_cols = self.columns
             combined_columns = other.index.to_pandas()
-            if not self.empty:
+            if len(current_cols):
+
+                if cudf.utils.dtypes.is_mixed_with_object_dtype(
+                    current_cols, combined_columns
+                ):
+                    raise TypeError(
+                        "cudf does not support mixed types, please type-cast "
+                        "the column index of dataframe and index of series "
+                        "to same dtypes."
+                    )
+
                 combined_columns = current_cols.union(
                     combined_columns, sort=False
                 )
@@ -6670,19 +6848,21 @@ class DataFrame(Frame, Serializable):
             to_concat = [self, *other]
         else:
             to_concat = [self, other]
-        to_concat = [
-            obj for obj in to_concat if isinstance(obj, Frame) and len(obj)
-        ]
-        if len(to_concat) == 0:
-            if ignore_index and len(self) != 0:
-                result = cudf.DataFrame(
-                    data=self._data.copy(), index=RangeIndex(len(self))
-                )
-            else:
-                result = self.copy()
-            return result
 
         return cudf.concat(to_concat, ignore_index=ignore_index, sort=sort)
+
+    @copy_docstring(reshape.pivot)
+    def pivot(self, index, columns, values=None):
+
+        return cudf.core.reshape.pivot(
+            self, index=index, columns=columns, values=values
+        )
+
+    @copy_docstring(reshape.unstack)
+    def unstack(self, level=-1, fill_value=None):
+        return cudf.core.reshape.unstack(
+            self, level=level, fill_value=fill_value
+        )
 
 
 def from_pandas(obj, nan_as_null=None):
@@ -6936,3 +7116,25 @@ def _get_union_of_series_names(series_list):
         names_list = [*range(len(series_list))]
 
     return names_list
+
+
+def _drop_columns(df, columns, errors):
+    for c in columns:
+        try:
+            df._drop_column(c)
+        except KeyError as e:
+            if errors == "ignore":
+                pass
+            else:
+                raise e
+
+
+def _get_host_unique(array):
+    if isinstance(
+        array, (cudf.Series, cudf.Index, cudf.core.column.ColumnBase)
+    ):
+        return array.unique.to_pandas()
+    elif isinstance(array, (str, numbers.Number)):
+        return [array]
+    else:
+        return set(array)

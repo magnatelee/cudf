@@ -17,6 +17,8 @@ cmake_minimum_required(VERSION 3.12 FATAL_ERROR)
 
 project(CUDF_JNI VERSION 0.7.0 LANGUAGES C CXX CUDA)
 
+set(CUDF_CPP_BUILD_DIR "${PROJECT_SOURCE_DIR}/../../../../cpp/build")
+
 ###################################################################################################
 # - build type ------------------------------------------------------------------------------------
 
@@ -45,16 +47,6 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 if(CMAKE_COMPILER_IS_GNUCXX)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror -Wno-error=deprecated-declarations")
-
-    option(CMAKE_CXX11_ABI "Enable the GLIBCXX11 ABI" ON)
-    if(CMAKE_CXX11_ABI)
-        message(STATUS "CUDF: Enabling the GLIBCXX11 ABI")
-    else()
-        message(STATUS "CUDF: Disabling the GLIBCXX11 ABI")
-        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=0")
-        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=0")
-        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler -D_GLIBCXX_USE_CXX11_ABI=0")
-    endif(CMAKE_CXX11_ABI)
 endif(CMAKE_COMPILER_IS_GNUCXX)
 
 #set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode=arch=compute_60,code=sm_60 -gencode=arch=compute_61,code=sm_61")
@@ -109,20 +101,21 @@ include(CheckLibraryExists)
 
 find_path(THRUST_INCLUDE "thrust"
     HINTS "$ENV{CUDF_ROOT}/_deps/thrust-src"
-          "${PROJECT_SOURCE_DIR}/../../../../cpp/build/_deps/thrust-src"
+          "${CUDF_CPP_BUILD_DIR}/_deps/thrust-src"
           "$ENV{CONDA_PREFIX}/include")
 
 find_path(CUB_INCLUDE "cub"
-    HINTS "$ENV{CUDF_ROOT}/_deps/cub-src"
-          "${PROJECT_SOURCE_DIR}/../../../../cpp/build/_deps/cub-src"
+    HINTS "$ENV{CUDF_ROOT}/_deps/thrust-src"
+          "${CUDF_CPP_BUILD_DIR}/_deps/thrust-src"
           "$ENV{CONDA_PREFIX}/include")
 
 find_path(LIBCUDACXX_INCLUDE "simt"
     HINTS "$ENV{CUDF_ROOT}/_deps/libcudacxx-src/include"
-          "${PROJECT_SOURCE_DIR}/../../../../cpp/build/_deps/libcudacxx-src/include")
+          "${CUDF_CPP_BUILD_DIR}/_deps/libcudacxx-src/include")
 
 find_path(SPDLOG_INCLUDE "spdlog"
     HINTS "$ENV{RMM_ROOT}/_deps/spdlog-src/include"
+          "$ENV{RMM_ROOT}/include"
           "$ENV{CONDA_PREFIX}/include")
 
 ###################################################################################################
@@ -135,7 +128,7 @@ find_library(CUDF_LIBRARY "cudf"
     HINTS "$ENV{CUDF_ROOT}"
           "$ENV{CUDF_ROOT}/lib"
           "$ENV{CONDA_PREFIX}/lib"
-          "../../../../cpp/build")
+          "${CUDF_CPP_BUILD_DIR}")
 
 message(STATUS "CUDF: CUDF_LIBRARY set to ${CUDF_LIBRARY}")
 message(STATUS "CUDF: CUDF_INCLUDE set to ${CUDF_INCLUDE}")
@@ -156,6 +149,28 @@ find_path(RMM_INCLUDE "rmm"
                 "$ENV{CONDA_PREFIX}/include")
 
 message(STATUS "RMM: RMM_INCLUDE set to ${RMM_INCLUDE}")
+
+###################################################################################################
+# - ARROW -----------------------------------------------------------------------------------------
+
+find_path(ARROW_INCLUDE "arrow"
+          HINTS "$ENV{ARROW_ROOT}/include"
+                "$ENV{CONDA_PREFIX}/include"
+                "${CUDF_CPP_BUILD_DIR}/arrow/install/include")
+
+message(STATUS "ARROW: ARROW_INCLUDE set to ${ARROW_INCLUDE}")
+
+# Find static version of Arrow lib
+find_library(ARROW_LIBRARY libarrow.a
+  HINTS "$ENV{ARROW_ROOT}/lib"
+        "$ENV{CONDA_PREFIX}/lib"
+        "${CUDF_CPP_BUILD_DIR}/arrow/install/lib")
+
+if(NOT ARROW_LIBRARY)
+  message(FATAL_ERROR "Arrow static libs not found. Was libcudf built with ARROW_STATIC_LIB=ON?")
+else()
+  message(STATUS "ARROW: ARROW_LIBRARY set to ${ARROW_LIBRARY}")
+endif(NOT ARROW_LIBRARY)
 
 ###################################################################################################
 # - find JNI -------------------------------------------------------------------------------------
@@ -179,7 +194,8 @@ include_directories("${THRUST_INCLUDE}"
                     "${CMAKE_SOURCE_DIR}/src"
                     "${JNI_INCLUDE_DIRS}"
                     "${CUDF_INCLUDE}"
-                    "${RMM_INCLUDE}")
+                    "${RMM_INCLUDE}"
+                    "${ARROW_INCLUDE}")
 
 ###################################################################################################
 # - library paths ---------------------------------------------------------------------------------
@@ -223,7 +239,23 @@ if(PER_THREAD_DEFAULT_STREAM)
     add_compile_definitions(CUDA_API_PER_THREAD_DEFAULT_STREAM)
 endif(PER_THREAD_DEFAULT_STREAM)
 
+# Set a default logging level if none was specified
+set(DEFAULT_LOGGING_LEVEL INFO)
+
+if(NOT LOGGING_LEVEL)
+    message(STATUS "Setting logging level to '${DEFAULT_LOGGING_LEVEL}' since none specified.")
+    set(LOGGING_LEVEL "${DEFAULT_LOGGING_LEVEL}" CACHE
+      STRING "Choose the logging level." FORCE)
+    # Set the possible values of build type for cmake-gui
+    set_property(CACHE LOGGING_LEVEL PROPERTY STRINGS
+        "TRACE" "DEBUG" "INFO" "WARN" "ERROR" "CRITICAL" "OFF")
+else()
+    message(STATUS "Setting logging level to '${LOGGING_LEVEL}'")
+endif(NOT LOGGING_LEVEL)
+
+target_compile_definitions(cudfjni PUBLIC SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_${LOGGING_LEVEL})
+
 ###################################################################################################
 # - link libraries --------------------------------------------------------------------------------
 
-target_link_libraries(cudfjni cudf ${CUDART_LIBRARY} cuda nvrtc)
+target_link_libraries(cudfjni cudf ${ARROW_LIBRARY} ${CUDART_LIBRARY} cuda nvrtc)

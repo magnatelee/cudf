@@ -699,7 +699,7 @@ def test_merge_sort(ons, hows):
     # the non-key columns will NOT match pandas ordering
     assert_eq(pd_merge[kwargs["on"]], gd_merge[kwargs["on"]])
     pd_merge = pd_merge.drop(kwargs["on"], axis=1)
-    gd_merge = gd_merge.drop(kwargs["on"])
+    gd_merge = gd_merge.drop(kwargs["on"], axis=1)
     if not pd_merge.empty:
         # check to make sure the non join key columns are the same
         pd_merge = pd_merge.sort_values(list(pd_merge.columns)).reset_index(
@@ -1487,5 +1487,32 @@ def test_series_dataframe_mixed_merging(lhs, rhs, how, kwargs):
 
     expect = check_lhs.merge(check_rhs, how=how, **kwargs)
     got = lhs.merge(rhs, how=how, **kwargs)
+
+    assert_eq(expect, got)
+
+
+@pytest.mark.parametrize(
+    "how", ["left", "inner", "right", "leftanti", "leftsemi"]
+)
+def test_merge_with_lists(how):
+    pd_left = pd.DataFrame(
+        {
+            "a": [1, 2, 3, 4, 5, 6],
+            "b": [[1, 2, 3], [4, 5], None, [6], [7, 8, None], []],
+            "c": ["a", "b", "c", "d", "e", "f"],
+        }
+    )
+    pd_right = pd.DataFrame(
+        {
+            "a": [4, 3, 2, 1, 0, -1],
+            "d": [[[1, 2], None], [], [[3, 4]], None, [[5], [6, 7]], [[8]]],
+        }
+    )
+
+    gd_left = cudf.from_pandas(pd_left)
+    gd_right = cudf.from_pandas(pd_right)
+
+    expect = pd_left.merge(pd_right, on="a")
+    got = gd_left.merge(gd_right, on="a")
 
     assert_eq(expect, got)

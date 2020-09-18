@@ -531,6 +531,16 @@ public class HostMemoryBuffer extends MemoryBuffer {
   }
 
   /**
+   * Copy data from this buffer to the given address.
+   * @param toAddress where the data should go
+   * @param len how much data to copy
+   */
+  final void copyToMemory(long toAddress, long len) {
+    addressOutOfBoundsCheck(address, len, "copy to memory");
+    UnsafeMemoryAccessor.copyMemory(null, address, null, toAddress, len);
+  }
+
+  /**
    * Synchronously copy from a DeviceMemoryBuffer to a HostMemoryBuffer
    * @param deviceMemoryBuffer buffer to copy data from
    */
@@ -605,5 +615,21 @@ public class HostMemoryBuffer extends MemoryBuffer {
         ret.close();
       }
     }
+  }
+
+  /**
+   * WARNING: Debug only method to print a passed in buffer
+   */
+  public void printBuffer() {
+    byte[] offsetbytes = new byte[(int)length];
+    System.out.println("BUFFER length =" + offsetbytes.length);
+    getBytes(offsetbytes, 0, 0, length);
+    for (int i = 0; i < offsetbytes.length; i++) {
+      System.out.print(offsetbytes[i]);
+      if (i%4 == 0) {
+        System.out.print(" ");
+      }
+    }
+    System.out.println();
   }
 }

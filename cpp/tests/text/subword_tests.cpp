@@ -28,8 +28,6 @@
 #include <iostream>
 #include <vector>
 
-#define MAX_NUM_SENTENCES 101
-#define MAX_NUM_CHARS 150000
 #define MAX_ROWS_TENSOR 300
 
 // Global environment for temporary files
@@ -62,7 +60,7 @@ void create_hashed_vocab(std::string const& hash_file)
 
 TEST(TextSubwordTest, Tokenize)
 {
-  uint32_t nrows = MAX_NUM_SENTENCES - 1;
+  uint32_t nrows = 100;
   std::vector<const char*> h_strings(nrows, "This is a test. A test this is.");
   cudf::test::strings_column_wrapper strings(h_strings.begin(), h_strings.end());
   std::string hash_file = temp_env->get_temp_filepath("hashed_vocab.txt");
@@ -77,8 +75,6 @@ TEST(TextSubwordTest, Tokenize)
                                          stride,
                                          true,   // do_lower_case
                                          false,  // do_truncate
-                                         MAX_NUM_SENTENCES,
-                                         MAX_NUM_CHARS,
                                          MAX_ROWS_TENSOR);
 
   EXPECT_EQ(nrows, result.nrows_tensor);
@@ -90,7 +86,7 @@ TEST(TextSubwordTest, Tokenize)
     for (auto idx = 0; idx < nrows; ++idx)
       h_expected.insert(h_expected.end(), base_data.begin(), base_data.end());
     cudf::test::fixed_width_column_wrapper<uint32_t> expected(h_expected.begin(), h_expected.end());
-    cudf::test::expect_columns_equal(result.tensor_token_ids->view(), expected);
+    CUDF_TEST_EXPECT_COLUMNS_EQUAL(result.tensor_token_ids->view(), expected);
   }
 
   {
@@ -99,7 +95,7 @@ TEST(TextSubwordTest, Tokenize)
     for (auto idx = 0; idx < nrows; ++idx)
       h_expected.insert(h_expected.end(), base_data.begin(), base_data.end());
     cudf::test::fixed_width_column_wrapper<uint32_t> expected(h_expected.begin(), h_expected.end());
-    cudf::test::expect_columns_equal(result.tensor_attention_mask->view(), expected);
+    CUDF_TEST_EXPECT_COLUMNS_EQUAL(result.tensor_attention_mask->view(), expected);
   }
 
   {
@@ -111,7 +107,7 @@ TEST(TextSubwordTest, Tokenize)
       h_expected.push_back(9);
     }
     cudf::test::fixed_width_column_wrapper<uint32_t> expected(h_expected.begin(), h_expected.end());
-    cudf::test::expect_columns_equal(result.tensor_metadata->view(), expected);
+    CUDF_TEST_EXPECT_COLUMNS_EQUAL(result.tensor_metadata->view(), expected);
   }
 }
 
@@ -131,20 +127,18 @@ TEST(TextSubwordTest, TokenizeMultiRow)
                                          stride,
                                          true,   // do_lower_case
                                          false,  // do_truncate
-                                         MAX_NUM_SENTENCES,
-                                         MAX_NUM_CHARS,
                                          MAX_ROWS_TENSOR);
 
   EXPECT_EQ(3, result.nrows_tensor);
   cudf::test::fixed_width_column_wrapper<uint32_t> expected_tokens(
     {2023, 2003, 1037, 3231, 1012, 0,    0,    0,    2023, 2003, 1037, 3231,
      1012, 2023, 2003, 1037, 2003, 1037, 3231, 1012, 0,    0,    0,    0});
-  cudf::test::expect_columns_equal(result.tensor_token_ids->view(), expected_tokens);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(result.tensor_token_ids->view(), expected_tokens);
   cudf::test::fixed_width_column_wrapper<uint32_t> expected_attn(
     {1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0});
-  cudf::test::expect_columns_equal(result.tensor_attention_mask->view(), expected_attn);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(result.tensor_attention_mask->view(), expected_attn);
   cudf::test::fixed_width_column_wrapper<uint32_t> expected_metadata({0, 0, 4, 1, 0, 6, 1, 1, 3});
-  cudf::test::expect_columns_equal(result.tensor_metadata->view(), expected_metadata);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(result.tensor_metadata->view(), expected_metadata);
 }
 
 TEST(TextSubwordTest, ParameterErrors)
@@ -159,8 +153,6 @@ TEST(TextSubwordTest, ParameterErrors)
                                         13,    // stride <= max_sequence_length
                                         true,  // do_lower_case
                                         true,  // do_truncate
-                                        MAX_NUM_SENTENCES,
-                                        MAX_NUM_CHARS,
                                         MAX_ROWS_TENSOR),
                cudf::logic_error);
 
@@ -170,15 +162,13 @@ TEST(TextSubwordTest, ParameterErrors)
                                         5,
                                         true,  // do_lower_case
                                         true,  // do_truncate
-                                        MAX_NUM_SENTENCES,
-                                        MAX_NUM_CHARS,
                                         858993459),
                cudf::logic_error);
 }
 
 TEST(TextSubwordTest, EmptyStrings)
 {
-  cudf::test::strings_column_wrapper strings({});
+  cudf::test::strings_column_wrapper strings;
   std::string hash_file = temp_env->get_temp_filepath("hashed_vocab.txt");
   create_hashed_vocab(hash_file);
   auto result = nvtext::subword_tokenize(cudf::strings_column_view{strings},
@@ -187,8 +177,24 @@ TEST(TextSubwordTest, EmptyStrings)
                                          16,
                                          true,   // do_lower_case
                                          false,  // do_truncate
-                                         MAX_NUM_SENTENCES,
-                                         MAX_NUM_CHARS,
+                                         MAX_ROWS_TENSOR);
+  EXPECT_EQ(0, result.nrows_tensor);
+  EXPECT_EQ(0, result.tensor_token_ids->size());
+  EXPECT_EQ(0, result.tensor_attention_mask->size());
+  EXPECT_EQ(0, result.tensor_metadata->size());
+}
+
+TEST(TextSubwordTest, AllNullStrings)
+{
+  cudf::test::strings_column_wrapper strings({"", "", ""}, {0, 0, 0});
+  std::string hash_file = temp_env->get_temp_filepath("hashed_vocab.txt");
+  create_hashed_vocab(hash_file);
+  auto result = nvtext::subword_tokenize(cudf::strings_column_view{strings},
+                                         hash_file,
+                                         16,
+                                         16,
+                                         true,   // do_lower_case
+                                         false,  // do_truncate
                                          MAX_ROWS_TENSOR);
   EXPECT_EQ(0, result.nrows_tensor);
   EXPECT_EQ(0, result.tensor_token_ids->size());
@@ -210,19 +216,17 @@ TEST(TextSubwordTest, TokenizeFromVocabStruct)
                                          6,
                                          true,  // do_lower_case
                                          true,  // do_truncate
-                                         MAX_NUM_SENTENCES,
-                                         MAX_NUM_CHARS,
                                          MAX_ROWS_TENSOR);
 
   EXPECT_EQ(2, result.nrows_tensor);
   cudf::test::fixed_width_column_wrapper<uint32_t> expected_tokens(
     {2023, 2003, 1037, 3231, 1012, 0, 0, 0, 2023, 2003, 1037, 3231, 1012, 2023, 2003, 1037});
-  cudf::test::expect_columns_equal(result.tensor_token_ids->view(), expected_tokens);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(result.tensor_token_ids->view(), expected_tokens);
   cudf::test::fixed_width_column_wrapper<uint32_t> expected_attn(
     {1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1});
-  cudf::test::expect_columns_equal(result.tensor_attention_mask->view(), expected_attn);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(result.tensor_attention_mask->view(), expected_attn);
   cudf::test::fixed_width_column_wrapper<uint32_t> expected_metadata({0, 0, 4, 1, 0, 7});
-  cudf::test::expect_columns_equal(result.tensor_metadata->view(), expected_metadata);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(result.tensor_metadata->view(), expected_metadata);
 }
 
 TEST(TextSubwordTest, LoadVocabFileErrors)

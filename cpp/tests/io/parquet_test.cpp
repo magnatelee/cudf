@@ -21,8 +21,9 @@
 #include <tests/utilities/type_lists.hpp>
 
 #include <cudf/concatenate.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/io/data_sink.hpp>
-#include <cudf/io/functions.hpp>
+#include <cudf/io/parquet.hpp>
 #include <cudf/strings/string_view.cuh>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/table/table.hpp>
@@ -33,13 +34,14 @@
 
 namespace cudf_io = cudf::io;
 
-template <typename T>
-using column_wrapper = typename std::conditional<std::is_same<T, cudf::string_view>::value,
-                                                 cudf::test::strings_column_wrapper,
-                                                 cudf::test::fixed_width_column_wrapper<T>>::type;
-using column         = cudf::column;
-using table          = cudf::table;
-using table_view     = cudf::table_view;
+template <typename T, typename SourceElementT = T>
+using column_wrapper =
+  typename std::conditional<std::is_same<T, cudf::string_view>::value,
+                            cudf::test::strings_column_wrapper,
+                            cudf::test::fixed_width_column_wrapper<T, SourceElementT>>::type;
+using column     = cudf::column;
+using table      = cudf::table;
+using table_view = cudf::table_view;
 
 // Global environment for temporary files
 auto const temp_env = static_cast<cudf::test::TempDirTestEnvironment*>(
@@ -98,6 +100,10 @@ std::unique_ptr<cudf::table> create_compressible_fixed_table(cudf::size_type num
 struct ParquetWriterTest : public cudf::test::BaseFixture {
 };
 
+// Base test fixture for tests
+struct ParquetReaderTest : public cudf::test::BaseFixture {
+};
+
 // Base test fixture for "stress" tests
 struct ParquetWriterStressTest : public cudf::test::BaseFixture {
 };
@@ -110,7 +116,7 @@ struct ParquetWriterNumericTypeTest : public ParquetWriterTest {
 
 // Typed test fixture for timestamp type tests
 template <typename T>
-struct ParquetWriterTimestampTypeTest : public ParquetWriterTest {
+struct ParquetWriterChronoTypeTest : public ParquetWriterTest {
   auto type() { return cudf::data_type{cudf::type_to_id<T>()}; }
 };
 
@@ -118,8 +124,8 @@ struct ParquetWriterTimestampTypeTest : public ParquetWriterTest {
 // TODO: Replace with `NumericTypes` when unsigned support is added. Issue #5352
 using SupportedTypes = cudf::test::Types<int8_t, int16_t, int32_t, int64_t, bool, float, double>;
 TYPED_TEST_CASE(ParquetWriterNumericTypeTest, SupportedTypes);
-using SupportedTimestampTypes = cudf::test::TimestampTypes;
-TYPED_TEST_CASE(ParquetWriterTimestampTypeTest, SupportedTimestampTypes);
+using SupportedChronoTypes = cudf::test::Concat<cudf::test::ChronoTypes, cudf::test::DurationTypes>;
+TYPED_TEST_CASE(ParquetWriterChronoTypeTest, SupportedChronoTypes);
 
 // Base test fixture for chunked writer tests
 struct ParquetChunkedWriterTest : public cudf::test::BaseFixture {
@@ -158,12 +164,12 @@ inline auto random_values(size_t size)
 }
 
 // Helper function to compare two tables
-void expect_tables_equal(cudf::table_view const& lhs, cudf::table_view const& rhs)
+void CUDF_TEST_EXPECT_TABLES_EQUAL(cudf::table_view const& lhs, cudf::table_view const& rhs)
 {
   EXPECT_EQ(lhs.num_columns(), rhs.num_columns());
   auto expected = lhs.begin();
   auto result   = rhs.begin();
-  while (result != rhs.end()) { cudf::test::expect_columns_equal(*expected++, *result++); }
+  while (result != rhs.end()) { CUDF_TEST_EXPECT_COLUMNS_EQUAL(*expected++, *result++); }
 }
 
 }  // namespace
@@ -183,13 +189,15 @@ TYPED_TEST(ParquetWriterNumericTypeTest, SingleColumn)
   EXPECT_EQ(1, expected->num_columns());
 
   auto filepath = temp_env->get_temp_filepath("SingleColumn.parquet");
-  cudf_io::write_parquet_args out_args{cudf_io::sink_info{filepath}, expected->view()};
-  cudf_io::write_parquet(out_args);
+  cudf_io::parquet_writer_options out_opts =
+    cudf_io::parquet_writer_options::builder(cudf_io::sink_info{filepath}, expected->view());
+  cudf_io::write_parquet(out_opts);
 
-  cudf_io::read_parquet_args in_args{cudf_io::source_info{filepath}};
-  auto result = cudf_io::read_parquet(in_args);
+  cudf_io::parquet_reader_options in_opts =
+    cudf_io::parquet_reader_options::builder(cudf_io::source_info{filepath});
+  auto result = cudf_io::read_parquet(in_opts);
 
-  expect_tables_equal(expected->view(), result.tbl->view());
+  CUDF_TEST_EXPECT_TABLES_EQUAL(expected->view(), result.tbl->view());
 }
 
 TYPED_TEST(ParquetWriterNumericTypeTest, SingleColumnWithNulls)
@@ -207,64 +215,72 @@ TYPED_TEST(ParquetWriterNumericTypeTest, SingleColumnWithNulls)
   EXPECT_EQ(1, expected->num_columns());
 
   auto filepath = temp_env->get_temp_filepath("SingleColumnWithNulls.parquet");
-  cudf_io::write_parquet_args out_args{cudf_io::sink_info{filepath}, expected->view()};
-  cudf_io::write_parquet(out_args);
+  cudf_io::parquet_writer_options out_opts =
+    cudf_io::parquet_writer_options::builder(cudf_io::sink_info{filepath}, expected->view());
+  cudf_io::write_parquet(out_opts);
 
-  cudf_io::read_parquet_args in_args{cudf_io::source_info{filepath}};
-  auto result = cudf_io::read_parquet(in_args);
+  cudf_io::parquet_reader_options in_opts =
+    cudf_io::parquet_reader_options::builder(cudf_io::source_info{filepath});
+  auto result = cudf_io::read_parquet(in_opts);
 
-  expect_tables_equal(expected->view(), result.tbl->view());
+  CUDF_TEST_EXPECT_TABLES_EQUAL(expected->view(), result.tbl->view());
 }
 
-TYPED_TEST(ParquetWriterTimestampTypeTest, Timestamps)
+TYPED_TEST(ParquetWriterChronoTypeTest, Chronos)
 {
   auto sequence = cudf::test::make_counting_transform_iterator(
-    0, [](auto i) { return TypeParam((std::rand() / 10000) * 1000); });
+    0, [](auto i) { return ((std::rand() / 10000) * 1000); });
   auto validity = cudf::test::make_counting_transform_iterator(0, [](auto i) { return true; });
 
   constexpr auto num_rows = 100;
-  column_wrapper<TypeParam> col(sequence, sequence + num_rows, validity);
+  column_wrapper<TypeParam, typename decltype(sequence)::value_type> col(
+    sequence, sequence + num_rows, validity);
 
   std::vector<std::unique_ptr<column>> cols;
   cols.push_back(col.release());
   auto expected = std::make_unique<table>(std::move(cols));
   EXPECT_EQ(1, expected->num_columns());
 
-  auto filepath = temp_env->get_temp_filepath("Timestamps.parquet");
-  cudf_io::write_parquet_args out_args{cudf_io::sink_info{filepath}, expected->view()};
-  cudf_io::write_parquet(out_args);
+  auto filepath = temp_env->get_temp_filepath("Chronos.parquet");
+  cudf_io::parquet_writer_options out_opts =
+    cudf_io::parquet_writer_options::builder(cudf_io::sink_info{filepath}, expected->view());
+  cudf_io::write_parquet(out_opts);
 
-  cudf_io::read_parquet_args in_args{cudf_io::source_info{filepath}};
-  in_args.timestamp_type = this->type();
-  auto result            = cudf_io::read_parquet(in_args);
+  cudf_io::parquet_reader_options in_opts =
+    cudf_io::parquet_reader_options::builder(cudf_io::source_info{filepath})
+      .timestamp_type(this->type());
+  auto result = cudf_io::read_parquet(in_opts);
 
-  expect_tables_equal(expected->view(), result.tbl->view());
+  CUDF_TEST_EXPECT_TABLES_EQUAL(expected->view(), result.tbl->view());
 }
 
-TYPED_TEST(ParquetWriterTimestampTypeTest, TimestampsWithNulls)
+TYPED_TEST(ParquetWriterChronoTypeTest, ChronosWithNulls)
 {
   auto sequence = cudf::test::make_counting_transform_iterator(
-    0, [](auto i) { return TypeParam((std::rand() / 10000) * 1000); });
+    0, [](auto i) { return ((std::rand() / 10000) * 1000); });
   auto validity =
     cudf::test::make_counting_transform_iterator(0, [](auto i) { return (i > 30) && (i < 60); });
 
   constexpr auto num_rows = 100;
-  column_wrapper<TypeParam> col(sequence, sequence + num_rows, validity);
+  column_wrapper<TypeParam, typename decltype(sequence)::value_type> col(
+    sequence, sequence + num_rows, validity);
 
   std::vector<std::unique_ptr<column>> cols;
   cols.push_back(col.release());
   auto expected = std::make_unique<table>(std::move(cols));
   EXPECT_EQ(1, expected->num_columns());
 
-  auto filepath = temp_env->get_temp_filepath("TimestampsWithNulls.parquet");
-  cudf_io::write_parquet_args out_args{cudf_io::sink_info{filepath}, expected->view()};
-  cudf_io::write_parquet(out_args);
+  auto filepath = temp_env->get_temp_filepath("ChronosWithNulls.parquet");
+  cudf_io::parquet_writer_options out_opts =
+    cudf_io::parquet_writer_options::builder(cudf_io::sink_info{filepath}, expected->view());
+  cudf_io::write_parquet(out_opts);
 
-  cudf_io::read_parquet_args in_args{cudf_io::source_info{filepath}};
-  in_args.timestamp_type = this->type();
-  auto result            = cudf_io::read_parquet(in_args);
+  cudf_io::parquet_reader_options in_opts =
+    cudf_io::parquet_reader_options::builder(cudf_io::source_info{filepath})
+      .timestamp_type(this->type());
+  auto result = cudf_io::read_parquet(in_opts);
 
-  expect_tables_equal(expected->view(), result.tbl->view());
+  CUDF_TEST_EXPECT_TABLES_EQUAL(expected->view(), result.tbl->view());
 }
 
 TEST_F(ParquetWriterTest, MultiColumn)
@@ -306,14 +322,16 @@ TEST_F(ParquetWriterTest, MultiColumn)
   EXPECT_EQ(5, expected->num_columns());
 
   auto filepath = temp_env->get_temp_filepath("MultiColumn.parquet");
-  cudf_io::write_parquet_args out_args{
-    cudf_io::sink_info{filepath}, expected->view(), &expected_metadata};
-  cudf_io::write_parquet(out_args);
+  cudf_io::parquet_writer_options out_opts =
+    cudf_io::parquet_writer_options::builder(cudf_io::sink_info{filepath}, expected->view())
+      .metadata(&expected_metadata);
+  cudf_io::write_parquet(out_opts);
 
-  cudf_io::read_parquet_args in_args{cudf_io::source_info{filepath}};
-  auto result = cudf_io::read_parquet(in_args);
+  cudf_io::parquet_reader_options in_opts =
+    cudf_io::parquet_reader_options::builder(cudf_io::source_info{filepath});
+  auto result = cudf_io::read_parquet(in_opts);
 
-  expect_tables_equal(expected->view(), result.tbl->view());
+  CUDF_TEST_EXPECT_TABLES_EQUAL(expected->view(), result.tbl->view());
   EXPECT_EQ(expected_metadata.column_names, result.metadata.column_names);
 }
 
@@ -364,14 +382,16 @@ TEST_F(ParquetWriterTest, MultiColumnWithNulls)
   EXPECT_EQ(5, expected->num_columns());
 
   auto filepath = temp_env->get_temp_filepath("MultiColumnWithNulls.parquet");
-  cudf_io::write_parquet_args out_args{
-    cudf_io::sink_info{filepath}, expected->view(), &expected_metadata};
-  cudf_io::write_parquet(out_args);
+  cudf_io::parquet_writer_options out_opts =
+    cudf_io::parquet_writer_options::builder(cudf_io::sink_info{filepath}, expected->view())
+      .metadata(&expected_metadata);
+  cudf_io::write_parquet(out_opts);
 
-  cudf_io::read_parquet_args in_args{cudf_io::source_info{filepath}};
-  auto result = cudf_io::read_parquet(in_args);
+  cudf_io::parquet_reader_options in_opts =
+    cudf_io::parquet_reader_options::builder(cudf_io::source_info{filepath});
+  auto result = cudf_io::read_parquet(in_opts);
 
-  expect_tables_equal(expected->view(), result.tbl->view());
+  CUDF_TEST_EXPECT_TABLES_EQUAL(expected->view(), result.tbl->view());
   EXPECT_EQ(expected_metadata.column_names, result.metadata.column_names);
 }
 
@@ -402,14 +422,60 @@ TEST_F(ParquetWriterTest, Strings)
   EXPECT_EQ(3, expected->num_columns());
 
   auto filepath = temp_env->get_temp_filepath("Strings.parquet");
-  cudf_io::write_parquet_args out_args{
-    cudf_io::sink_info{filepath}, expected->view(), &expected_metadata};
-  cudf_io::write_parquet(out_args);
+  cudf_io::parquet_writer_options out_opts =
+    cudf_io::parquet_writer_options::builder(cudf_io::sink_info{filepath}, expected->view())
+      .metadata(&expected_metadata);
+  cudf_io::write_parquet(out_opts);
 
-  cudf_io::read_parquet_args in_args{cudf_io::source_info{filepath}};
-  auto result = cudf_io::read_parquet(in_args);
+  cudf_io::parquet_reader_options in_opts =
+    cudf_io::parquet_reader_options::builder(cudf_io::source_info{filepath});
+  auto result = cudf_io::read_parquet(in_opts);
 
-  expect_tables_equal(expected->view(), result.tbl->view());
+  CUDF_TEST_EXPECT_TABLES_EQUAL(expected->view(), result.tbl->view());
+  EXPECT_EQ(expected_metadata.column_names, result.metadata.column_names);
+}
+
+TEST_F(ParquetWriterTest, SlicedTable)
+{
+  // This test checks for writing zero copy, offseted views into existing cudf tables
+
+  std::vector<const char*> strings{
+    "Monday", "Monday", "Friday", "Monday", "Friday", "Friday", "Friday", "Funday"};
+  const auto num_rows = strings.size();
+
+  auto seq_col0 = random_values<int>(num_rows);
+  auto seq_col2 = random_values<float>(num_rows);
+  auto validity = cudf::test::make_counting_transform_iterator(0, [](auto i) { return true; });
+
+  column_wrapper<int> col0{seq_col0.begin(), seq_col0.end(), validity};
+  column_wrapper<cudf::string_view> col1{strings.begin(), strings.end()};
+  column_wrapper<float> col2{seq_col2.begin(), seq_col2.end(), validity};
+
+  cudf_io::table_metadata expected_metadata;
+  expected_metadata.column_names.emplace_back("col_other");
+  expected_metadata.column_names.emplace_back("col_string");
+  expected_metadata.column_names.emplace_back("col_another");
+
+  std::vector<std::unique_ptr<column>> cols;
+  cols.push_back(col0.release());
+  cols.push_back(col1.release());
+  cols.push_back(col2.release());
+  auto expected = std::make_unique<table>(std::move(cols));
+  EXPECT_EQ(3, expected->num_columns());
+
+  auto expected_slice = cudf::slice(expected->view(), {2, static_cast<cudf::size_type>(num_rows)});
+
+  auto filepath = temp_env->get_temp_filepath("SlicedTable.parquet");
+  cudf_io::parquet_writer_options out_opts =
+    cudf_io::parquet_writer_options::builder(cudf_io::sink_info{filepath}, expected_slice)
+      .metadata(&expected_metadata);
+  cudf_io::write_parquet(out_opts);
+
+  cudf_io::parquet_reader_options in_opts =
+    cudf_io::parquet_reader_options::builder(cudf_io::source_info{filepath});
+  auto result = cudf_io::read_parquet(in_opts);
+
+  CUDF_TEST_EXPECT_TABLES_EQUAL(expected_slice, result.tbl->view());
   EXPECT_EQ(expected_metadata.column_names, result.metadata.column_names);
 }
 
@@ -449,16 +515,18 @@ TEST_F(ParquetWriterTest, MultiIndex)
   EXPECT_EQ(5, expected->num_columns());
 
   auto filepath = temp_env->get_temp_filepath("MultiIndex.parquet");
-  cudf_io::write_parquet_args out_args{
-    cudf_io::sink_info{filepath}, expected->view(), &expected_metadata};
-  cudf_io::write_parquet(out_args);
+  cudf_io::parquet_writer_options out_opts =
+    cudf_io::parquet_writer_options::builder(cudf_io::sink_info{filepath}, expected->view())
+      .metadata(&expected_metadata);
+  cudf_io::write_parquet(out_opts);
 
-  cudf_io::read_parquet_args in_args{cudf_io::source_info{filepath}};
-  in_args.use_pandas_metadata = true;
-  in_args.columns             = {"int8s", "int16s", "int32s"};
-  auto result                 = cudf_io::read_parquet(in_args);
+  cudf_io::parquet_reader_options in_opts =
+    cudf_io::parquet_reader_options::builder(cudf_io::source_info{filepath})
+      .use_pandas_metadata(true)
+      .columns({"int8s", "int16s", "int32s"});
+  auto result = cudf_io::read_parquet(in_opts);
 
-  expect_tables_equal(expected->view(), result.tbl->view());
+  CUDF_TEST_EXPECT_TABLES_EQUAL(expected->view(), result.tbl->view());
   EXPECT_EQ(expected_metadata.column_names, result.metadata.column_names);
 }
 
@@ -479,13 +547,15 @@ TEST_F(ParquetWriterTest, HostBuffer)
   EXPECT_EQ(1, expected->num_columns());
 
   std::vector<char> out_buffer;
-  cudf_io::write_parquet_args out_args{
-    cudf_io::sink_info(&out_buffer), expected->view(), &expected_metadata};
-  cudf_io::write_parquet(out_args);
-  cudf_io::read_parquet_args in_args{cudf_io::source_info(out_buffer.data(), out_buffer.size())};
-  const auto result = cudf_io::read_parquet(in_args);
+  cudf_io::parquet_writer_options out_opts =
+    cudf_io::parquet_writer_options::builder(cudf_io::sink_info(&out_buffer), expected->view())
+      .metadata(&expected_metadata);
+  cudf_io::write_parquet(out_opts);
+  cudf_io::parquet_reader_options in_opts = cudf_io::parquet_reader_options::builder(
+    cudf_io::source_info(out_buffer.data(), out_buffer.size()));
+  const auto result = cudf_io::read_parquet(in_opts);
 
-  expect_tables_equal(expected->view(), result.tbl->view());
+  CUDF_TEST_EXPECT_TABLES_EQUAL(expected->view(), result.tbl->view());
   EXPECT_EQ(expected_metadata.column_names, result.metadata.column_names);
 }
 
@@ -495,13 +565,15 @@ TEST_F(ParquetWriterTest, NonNullable)
   auto expected = create_random_fixed_table<int>(9, 9, false);
 
   auto filepath = temp_env->get_temp_filepath("NonNullable.parquet");
-  cudf_io::write_parquet_args args{cudf_io::sink_info{filepath}, *expected};
+  cudf_io::parquet_writer_options args =
+    cudf_io::parquet_writer_options::builder(cudf_io::sink_info{filepath}, *expected);
   cudf_io::write_parquet(args);
 
-  cudf_io::read_parquet_args read_args{cudf_io::source_info{filepath}};
-  auto result = cudf_io::read_parquet(read_args);
+  cudf_io::parquet_reader_options read_opts =
+    cudf_io::parquet_reader_options::builder(cudf_io::source_info{filepath});
+  auto result = cudf_io::read_parquet(read_opts);
 
-  expect_tables_equal(*result.tbl, *expected);
+  CUDF_TEST_EXPECT_TABLES_EQUAL(*result.tbl, *expected);
 }
 
 // custom data sink that supports device writes. uses plain file io.
@@ -552,26 +624,30 @@ TEST_F(ParquetWriterTest, CustomDataSink)
 
   // write out using the custom sink
   {
-    cudf_io::write_parquet_args args{cudf_io::sink_info{&custom_sink}, *expected};
+    cudf_io::parquet_writer_options args =
+      cudf_io::parquet_writer_options::builder(cudf_io::sink_info{&custom_sink}, *expected);
     cudf_io::write_parquet(args);
   }
 
   // write out using a memmapped sink
   std::vector<char> buf_sink;
   {
-    cudf_io::write_parquet_args args{cudf_io::sink_info{&buf_sink}, *expected};
+    cudf_io::parquet_writer_options args =
+      cudf_io::parquet_writer_options::builder(cudf_io::sink_info{&buf_sink}, *expected);
     cudf_io::write_parquet(args);
   }
 
   // read them back in and make sure everything matches
 
-  cudf_io::read_parquet_args custom_args{cudf_io::source_info{filepath}};
+  cudf_io::parquet_reader_options custom_args =
+    cudf_io::parquet_reader_options::builder(cudf_io::source_info{filepath});
   auto custom_tbl = cudf_io::read_parquet(custom_args);
-  expect_tables_equal(custom_tbl.tbl->view(), expected->view());
+  CUDF_TEST_EXPECT_TABLES_EQUAL(custom_tbl.tbl->view(), expected->view());
 
-  cudf_io::read_parquet_args buf_args{cudf_io::source_info{buf_sink.data(), buf_sink.size()}};
+  cudf_io::parquet_reader_options buf_args = cudf_io::parquet_reader_options::builder(
+    cudf_io::source_info{buf_sink.data(), buf_sink.size()});
   auto buf_tbl = cudf_io::read_parquet(buf_args);
-  expect_tables_equal(buf_tbl.tbl->view(), expected->view());
+  CUDF_TEST_EXPECT_TABLES_EQUAL(buf_tbl.tbl->view(), expected->view());
 }
 
 TEST_F(ParquetWriterTest, DeviceWriteLargeishFile)
@@ -586,12 +662,14 @@ TEST_F(ParquetWriterTest, DeviceWriteLargeishFile)
   auto expected = create_random_fixed_table<int>(4, 4 * 1024 * 1024, false);
 
   // write out using the custom sink (which uses device writes)
-  cudf_io::write_parquet_args args{cudf_io::sink_info{&custom_sink}, *expected};
+  cudf_io::parquet_writer_options args =
+    cudf_io::parquet_writer_options::builder(cudf_io::sink_info{&custom_sink}, *expected);
   cudf_io::write_parquet(args);
 
-  cudf_io::read_parquet_args custom_args{cudf_io::source_info{filepath}};
+  cudf_io::parquet_reader_options custom_args =
+    cudf_io::parquet_reader_options::builder(cudf_io::source_info{filepath});
   auto custom_tbl = cudf_io::read_parquet(custom_args);
-  expect_tables_equal(custom_tbl.tbl->view(), expected->view());
+  CUDF_TEST_EXPECT_TABLES_EQUAL(custom_tbl.tbl->view(), expected->view());
 }
 template <typename T>
 std::string create_parquet_file(int num_cols)
@@ -600,8 +678,9 @@ std::string create_parquet_file(int num_cols)
   auto const table = create_random_fixed_table<T>(num_cols, 10, true);
   auto const filepath =
     temp_env->get_temp_filepath(typeid(T).name() + std::to_string(num_cols) + ".parquet");
-  cudf_io::write_parquet_args const out_args{cudf_io::sink_info{filepath}, table->view()};
-  cudf_io::write_parquet(out_args);
+  cudf_io::parquet_writer_options const out_opts =
+    cudf_io::parquet_writer_options::builder(cudf_io::sink_info{filepath}, table->view());
+  cudf_io::write_parquet(out_opts);
   return filepath;
 }
 
@@ -610,13 +689,15 @@ TEST_F(ParquetWriterTest, MultipleMismatchedSources)
   auto const int5file = create_parquet_file<int>(5);
   {
     auto const float5file = create_parquet_file<float>(5);
-    cudf_io::read_parquet_args const read_args{cudf_io::source_info{{int5file, float5file}}};
-    EXPECT_THROW(cudf_io::read_parquet(read_args), cudf::logic_error);
+    cudf_io::parquet_reader_options const read_opts =
+      cudf_io::parquet_reader_options::builder(cudf_io::source_info{{int5file, float5file}});
+    EXPECT_THROW(cudf_io::read_parquet(read_opts), cudf::logic_error);
   }
   {
     auto const int10file = create_parquet_file<int>(10);
-    cudf_io::read_parquet_args const read_args{cudf_io::source_info{{int5file, int10file}}};
-    EXPECT_THROW(cudf_io::read_parquet(read_args), cudf::logic_error);
+    cudf_io::parquet_reader_options const read_opts =
+      cudf_io::parquet_reader_options::builder(cudf_io::source_info{{int5file, int10file}});
+    EXPECT_THROW(cudf_io::read_parquet(read_opts), cudf::logic_error);
   }
 }
 
@@ -626,15 +707,17 @@ TEST_F(ParquetChunkedWriterTest, SingleTable)
   auto table1 = create_random_fixed_table<int>(5, 5, true);
 
   auto filepath = temp_env->get_temp_filepath("ChunkedSingle.parquet");
-  cudf_io::write_parquet_chunked_args args{cudf_io::sink_info{filepath}};
+  cudf_io::chunked_parquet_writer_options args =
+    cudf_io::chunked_parquet_writer_options::builder(cudf_io::sink_info{filepath});
   auto state = cudf_io::write_parquet_chunked_begin(args);
   cudf_io::write_parquet_chunked(*table1, state);
   cudf_io::write_parquet_chunked_end(state);
 
-  cudf_io::read_parquet_args read_args{cudf_io::source_info{filepath}};
-  auto result = cudf_io::read_parquet(read_args);
+  cudf_io::parquet_reader_options read_opts =
+    cudf_io::parquet_reader_options::builder(cudf_io::source_info{filepath});
+  auto result = cudf_io::read_parquet(read_opts);
 
-  expect_tables_equal(*result.tbl, *table1);
+  CUDF_TEST_EXPECT_TABLES_EQUAL(*result.tbl, *table1);
 }
 
 TEST_F(ParquetChunkedWriterTest, SimpleTable)
@@ -646,16 +729,18 @@ TEST_F(ParquetChunkedWriterTest, SimpleTable)
   auto full_table = cudf::concatenate({*table1, *table2});
 
   auto filepath = temp_env->get_temp_filepath("ChunkedSimple.parquet");
-  cudf_io::write_parquet_chunked_args args{cudf_io::sink_info{filepath}};
+  cudf_io::chunked_parquet_writer_options args =
+    cudf_io::chunked_parquet_writer_options::builder(cudf_io::sink_info{filepath});
   auto state = cudf_io::write_parquet_chunked_begin(args);
   cudf_io::write_parquet_chunked(*table1, state);
   cudf_io::write_parquet_chunked(*table2, state);
   cudf_io::write_parquet_chunked_end(state);
 
-  cudf_io::read_parquet_args read_args{cudf_io::source_info{filepath}};
-  auto result = cudf_io::read_parquet(read_args);
+  cudf_io::parquet_reader_options read_opts =
+    cudf_io::parquet_reader_options::builder(cudf_io::source_info{filepath});
+  auto result = cudf_io::read_parquet(read_opts);
 
-  expect_tables_equal(*result.tbl, *full_table);
+  CUDF_TEST_EXPECT_TABLES_EQUAL(*result.tbl, *full_table);
 }
 
 TEST_F(ParquetChunkedWriterTest, LargeTables)
@@ -667,17 +752,19 @@ TEST_F(ParquetChunkedWriterTest, LargeTables)
   auto full_table = cudf::concatenate({*table1, *table2});
 
   auto filepath = temp_env->get_temp_filepath("ChunkedLarge.parquet");
-  cudf_io::write_parquet_chunked_args args{cudf_io::sink_info{filepath}};
+  cudf_io::chunked_parquet_writer_options args =
+    cudf_io::chunked_parquet_writer_options::builder(cudf_io::sink_info{filepath});
   auto state = cudf_io::write_parquet_chunked_begin(args);
   cudf_io::write_parquet_chunked(*table1, state);
   cudf_io::write_parquet_chunked(*table2, state);
   auto md = cudf_io::write_parquet_chunked_end(state);
   CUDF_EXPECTS(!md, "The return value should be null.");
 
-  cudf_io::read_parquet_args read_args{cudf_io::source_info{filepath}};
-  auto result = cudf_io::read_parquet(read_args);
+  cudf_io::parquet_reader_options read_opts =
+    cudf_io::parquet_reader_options::builder(cudf_io::source_info{filepath});
+  auto result = cudf_io::read_parquet(read_opts);
 
-  expect_tables_equal(*result.tbl, *full_table);
+  CUDF_TEST_EXPECT_TABLES_EQUAL(*result.tbl, *full_table);
 }
 
 TEST_F(ParquetChunkedWriterTest, ManyTables)
@@ -695,7 +782,8 @@ TEST_F(ParquetChunkedWriterTest, ManyTables)
   auto expected = cudf::concatenate(table_views);
 
   auto filepath = temp_env->get_temp_filepath("ChunkedManyTables.parquet");
-  cudf_io::write_parquet_chunked_args args{cudf_io::sink_info{filepath}};
+  cudf_io::chunked_parquet_writer_options args =
+    cudf_io::chunked_parquet_writer_options::builder(cudf_io::sink_info{filepath});
   auto state = cudf_io::write_parquet_chunked_begin(args);
   std::for_each(table_views.begin(), table_views.end(), [&state](table_view const& tbl) {
     cudf_io::write_parquet_chunked(tbl, state);
@@ -703,10 +791,11 @@ TEST_F(ParquetChunkedWriterTest, ManyTables)
   auto md = cudf_io::write_parquet_chunked_end(state, true, "dummy/path");
   CUDF_EXPECTS(md, "The returned metadata should not be null.");
 
-  cudf_io::read_parquet_args read_args{cudf_io::source_info{filepath}};
-  auto result = cudf_io::read_parquet(read_args);
+  cudf_io::parquet_reader_options read_opts =
+    cudf_io::parquet_reader_options::builder(cudf_io::source_info{filepath});
+  auto result = cudf_io::read_parquet(read_opts);
 
-  expect_tables_equal(*result.tbl, *expected);
+  CUDF_TEST_EXPECT_TABLES_EQUAL(*result.tbl, *expected);
 }
 
 TEST_F(ParquetChunkedWriterTest, Strings)
@@ -728,16 +817,18 @@ TEST_F(ParquetChunkedWriterTest, Strings)
   auto expected = cudf::concatenate({tbl1, tbl2});
 
   auto filepath = temp_env->get_temp_filepath("ChunkedStrings.parquet");
-  cudf_io::write_parquet_chunked_args args{cudf_io::sink_info{filepath}};
+  cudf_io::chunked_parquet_writer_options args =
+    cudf_io::chunked_parquet_writer_options::builder(cudf_io::sink_info{filepath});
   auto state = cudf_io::write_parquet_chunked_begin(args);
   cudf_io::write_parquet_chunked(tbl1, state);
   cudf_io::write_parquet_chunked(tbl2, state);
   cudf_io::write_parquet_chunked_end(state);
 
-  cudf_io::read_parquet_args read_args{cudf_io::source_info{filepath}};
-  auto result = cudf_io::read_parquet(read_args);
+  cudf_io::parquet_reader_options read_opts =
+    cudf_io::parquet_reader_options::builder(cudf_io::source_info{filepath});
+  auto result = cudf_io::read_parquet(read_opts);
 
-  expect_tables_equal(*result.tbl, *expected);
+  CUDF_TEST_EXPECT_TABLES_EQUAL(*result.tbl, *expected);
 }
 
 TEST_F(ParquetChunkedWriterTest, MismatchedTypes)
@@ -747,7 +838,8 @@ TEST_F(ParquetChunkedWriterTest, MismatchedTypes)
   auto table2 = create_random_fixed_table<float>(4, 4, true);
 
   auto filepath = temp_env->get_temp_filepath("ChunkedMismatchedTypes.parquet");
-  cudf_io::write_parquet_chunked_args args{cudf_io::sink_info{filepath}};
+  cudf_io::chunked_parquet_writer_options args =
+    cudf_io::chunked_parquet_writer_options::builder(cudf_io::sink_info{filepath});
   auto state = cudf_io::write_parquet_chunked_begin(args);
   cudf_io::write_parquet_chunked(*table1, state);
   EXPECT_THROW(cudf_io::write_parquet_chunked(*table2, state), cudf::logic_error);
@@ -761,7 +853,8 @@ TEST_F(ParquetChunkedWriterTest, MismatchedStructure)
   auto table2 = create_random_fixed_table<float>(3, 4, true);
 
   auto filepath = temp_env->get_temp_filepath("ChunkedMismatchedStructure.parquet");
-  cudf_io::write_parquet_chunked_args args{cudf_io::sink_info{filepath}};
+  cudf_io::chunked_parquet_writer_options args =
+    cudf_io::chunked_parquet_writer_options::builder(cudf_io::sink_info{filepath});
   auto state = cudf_io::write_parquet_chunked_begin(args);
   cudf_io::write_parquet_chunked(*table1, state);
   EXPECT_THROW(cudf_io::write_parquet_chunked(*table2, state), cudf::logic_error);
@@ -777,17 +870,19 @@ TEST_F(ParquetChunkedWriterTest, ReadRowGroups)
   auto full_table = cudf::concatenate({*table2, *table1, *table2});
 
   auto filepath = temp_env->get_temp_filepath("ChunkedRowGroups.parquet");
-  cudf_io::write_parquet_chunked_args args{cudf_io::sink_info{filepath}};
+  cudf_io::chunked_parquet_writer_options args =
+    cudf_io::chunked_parquet_writer_options::builder(cudf_io::sink_info{filepath});
   auto state = cudf_io::write_parquet_chunked_begin(args);
   cudf_io::write_parquet_chunked(*table1, state);
   cudf_io::write_parquet_chunked(*table2, state);
   cudf_io::write_parquet_chunked_end(state);
 
-  cudf_io::read_parquet_args read_args{cudf_io::source_info{filepath}};
-  read_args.row_groups = {{1, 0, 1}};
-  auto result          = cudf_io::read_parquet(read_args);
+  cudf_io::parquet_reader_options read_opts =
+    cudf_io::parquet_reader_options::builder(cudf_io::source_info{filepath})
+      .row_groups({{1, 0, 1}});
+  auto result = cudf_io::read_parquet(read_opts);
 
-  expect_tables_equal(*result.tbl, *full_table);
+  CUDF_TEST_EXPECT_TABLES_EQUAL(*result.tbl, *full_table);
 }
 
 TEST_F(ParquetChunkedWriterTest, ReadRowGroupsError)
@@ -796,18 +891,19 @@ TEST_F(ParquetChunkedWriterTest, ReadRowGroupsError)
   auto table1 = create_random_fixed_table<int>(5, 5, true);
 
   auto filepath = temp_env->get_temp_filepath("ChunkedRowGroupsError.parquet");
-  cudf_io::write_parquet_chunked_args args{cudf_io::sink_info{filepath}};
+  cudf_io::chunked_parquet_writer_options args =
+    cudf_io::chunked_parquet_writer_options::builder(cudf_io::sink_info{filepath});
   auto state = cudf_io::write_parquet_chunked_begin(args);
   cudf_io::write_parquet_chunked(*table1, state);
   cudf_io::write_parquet_chunked_end(state);
 
-  cudf_io::read_parquet_args read_args{cudf_io::source_info{filepath}};
-  read_args.row_groups = {{0, 1}};
-  EXPECT_THROW(cudf_io::read_parquet(read_args), cudf::logic_error);
-  read_args.row_groups = {{-1}};
-  EXPECT_THROW(cudf_io::read_parquet(read_args), cudf::logic_error);
-  read_args.row_groups = {{0}, {0}};
-  EXPECT_THROW(cudf_io::read_parquet(read_args), cudf::logic_error);
+  cudf_io::parquet_reader_options read_opts =
+    cudf_io::parquet_reader_options::builder(cudf_io::source_info{filepath}).row_groups({{0, 1}});
+  EXPECT_THROW(cudf_io::read_parquet(read_opts), cudf::logic_error);
+  read_opts.set_row_groups({{-1}});
+  EXPECT_THROW(cudf_io::read_parquet(read_opts), cudf::logic_error);
+  read_opts.set_row_groups({{0}, {0}});
+  EXPECT_THROW(cudf_io::read_parquet(read_opts), cudf::logic_error);
 }
 
 TYPED_TEST(ParquetChunkedWriterNumericTypeTest, UnalignedSize)
@@ -823,20 +919,20 @@ TYPED_TEST(ParquetChunkedWriterNumericTypeTest, UnalignedSize)
   bool mask[] = {0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
                  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
 
-  T c1a[] = {5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
-             5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5};
-  T c1b[] = {6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
-             6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6};
+  T c1a[num_els];
+  std::fill(c1a, c1a + num_els, static_cast<T>(5));
+  T c1b[num_els];
+  std::fill(c1b, c1b + num_els, static_cast<T>(6));
   column_wrapper<T> c1a_w(c1a, c1a + num_els, mask);
   column_wrapper<T> c1b_w(c1b, c1b + num_els, mask);
   cols.push_back(c1a_w.release());
   cols.push_back(c1b_w.release());
   cudf::table tbl1(std::move(cols));
 
-  T c2a[] = {8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
-             8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8};
-  T c2b[] = {9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
-             9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9};
+  T c2a[num_els];
+  std::fill(c2a, c2a + num_els, static_cast<T>(8));
+  T c2b[num_els];
+  std::fill(c2b, c2b + num_els, static_cast<T>(9));
   column_wrapper<T> c2a_w(c2a, c2a + num_els, mask);
   column_wrapper<T> c2b_w(c2b, c2b + num_els, mask);
   cols.push_back(c2a_w.release());
@@ -846,16 +942,18 @@ TYPED_TEST(ParquetChunkedWriterNumericTypeTest, UnalignedSize)
   auto expected = cudf::concatenate({tbl1, tbl2});
 
   auto filepath = temp_env->get_temp_filepath("ChunkedUnalignedSize.parquet");
-  cudf_io::write_parquet_chunked_args args{cudf_io::sink_info{filepath}};
+  cudf_io::chunked_parquet_writer_options args =
+    cudf_io::chunked_parquet_writer_options::builder(cudf_io::sink_info{filepath});
   auto state = cudf_io::write_parquet_chunked_begin(args);
   cudf_io::write_parquet_chunked(tbl1, state);
   cudf_io::write_parquet_chunked(tbl2, state);
   cudf_io::write_parquet_chunked_end(state);
 
-  cudf_io::read_parquet_args read_args{cudf_io::source_info{filepath}};
-  auto result = cudf_io::read_parquet(read_args);
+  cudf_io::parquet_reader_options read_opts =
+    cudf_io::parquet_reader_options::builder(cudf_io::source_info{filepath});
+  auto result = cudf_io::read_parquet(read_opts);
 
-  expect_tables_equal(*result.tbl, *expected);
+  CUDF_TEST_EXPECT_TABLES_EQUAL(*result.tbl, *expected);
 }
 
 TYPED_TEST(ParquetChunkedWriterNumericTypeTest, UnalignedSize2)
@@ -871,20 +969,20 @@ TYPED_TEST(ParquetChunkedWriterNumericTypeTest, UnalignedSize2)
   bool mask[] = {0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
                  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
 
-  T c1a[] = {5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
-             5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5};
-  T c1b[] = {6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
-             6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6};
+  T c1a[num_els];
+  std::fill(c1a, c1a + num_els, static_cast<T>(5));
+  T c1b[num_els];
+  std::fill(c1b, c1b + num_els, static_cast<T>(6));
   column_wrapper<T> c1a_w(c1a, c1a + num_els, mask);
   column_wrapper<T> c1b_w(c1b, c1b + num_els, mask);
   cols.push_back(c1a_w.release());
   cols.push_back(c1b_w.release());
   cudf::table tbl1(std::move(cols));
 
-  T c2a[] = {8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
-             8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8};
-  T c2b[] = {9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
-             9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9};
+  T c2a[num_els];
+  std::fill(c2a, c2a + num_els, static_cast<T>(8));
+  T c2b[num_els];
+  std::fill(c2b, c2b + num_els, static_cast<T>(9));
   column_wrapper<T> c2a_w(c2a, c2a + num_els, mask);
   column_wrapper<T> c2b_w(c2b, c2b + num_els, mask);
   cols.push_back(c2a_w.release());
@@ -894,16 +992,18 @@ TYPED_TEST(ParquetChunkedWriterNumericTypeTest, UnalignedSize2)
   auto expected = cudf::concatenate({tbl1, tbl2});
 
   auto filepath = temp_env->get_temp_filepath("ChunkedUnalignedSize2.parquet");
-  cudf_io::write_parquet_chunked_args args{cudf_io::sink_info{filepath}};
+  cudf_io::chunked_parquet_writer_options args =
+    cudf_io::chunked_parquet_writer_options::builder(cudf_io::sink_info{filepath});
   auto state = cudf_io::write_parquet_chunked_begin(args);
   cudf_io::write_parquet_chunked(tbl1, state);
   cudf_io::write_parquet_chunked(tbl2, state);
   cudf_io::write_parquet_chunked_end(state);
 
-  cudf_io::read_parquet_args read_args{cudf_io::source_info{filepath}};
-  auto result = cudf_io::read_parquet(read_args);
+  cudf_io::parquet_reader_options read_opts =
+    cudf_io::parquet_reader_options::builder(cudf_io::source_info{filepath});
+  auto result = cudf_io::read_parquet(read_opts);
 
-  expect_tables_equal(*result.tbl, *expected);
+  CUDF_TEST_EXPECT_TABLES_EQUAL(*result.tbl, *expected);
 }
 
 // custom mem mapped data sink that supports device writes
@@ -955,12 +1055,14 @@ TEST_F(ParquetWriterStressTest, LargeTableWeakCompression)
   auto expected = create_random_fixed_table<int>(16, 4 * 1024 * 1024, false);
 
   // write out using the custom sink (which uses device writes)
-  cudf_io::write_parquet_args args{cudf_io::sink_info{&custom_sink}, *expected};
+  cudf_io::parquet_writer_options args =
+    cudf_io::parquet_writer_options::builder(cudf_io::sink_info{&custom_sink}, *expected);
   cudf_io::write_parquet(args);
 
-  cudf_io::read_parquet_args custom_args{cudf_io::source_info{mm_buf.data(), mm_buf.size()}};
+  cudf_io::parquet_reader_options custom_args =
+    cudf_io::parquet_reader_options::builder(cudf_io::source_info{mm_buf.data(), mm_buf.size()});
   auto custom_tbl = cudf_io::read_parquet(custom_args);
-  expect_tables_equal(custom_tbl.tbl->view(), expected->view());
+  CUDF_TEST_EXPECT_TABLES_EQUAL(custom_tbl.tbl->view(), expected->view());
 }
 
 TEST_F(ParquetWriterStressTest, LargeTableGoodCompression)
@@ -976,12 +1078,14 @@ TEST_F(ParquetWriterStressTest, LargeTableGoodCompression)
   auto expected = create_compressible_fixed_table<int>(16, 4 * 1024 * 1024, 128 * 1024, false);
 
   // write out using the custom sink (which uses device writes)
-  cudf_io::write_parquet_args args{cudf_io::sink_info{&custom_sink}, *expected};
+  cudf_io::parquet_writer_options args =
+    cudf_io::parquet_writer_options::builder(cudf_io::sink_info{&custom_sink}, *expected);
   cudf_io::write_parquet(args);
 
-  cudf_io::read_parquet_args custom_args{cudf_io::source_info{mm_buf.data(), mm_buf.size()}};
+  cudf_io::parquet_reader_options custom_args =
+    cudf_io::parquet_reader_options::builder(cudf_io::source_info{mm_buf.data(), mm_buf.size()});
   auto custom_tbl = cudf_io::read_parquet(custom_args);
-  expect_tables_equal(custom_tbl.tbl->view(), expected->view());
+  CUDF_TEST_EXPECT_TABLES_EQUAL(custom_tbl.tbl->view(), expected->view());
 }
 
 TEST_F(ParquetWriterStressTest, LargeTableWithValids)
@@ -997,12 +1101,14 @@ TEST_F(ParquetWriterStressTest, LargeTableWithValids)
   auto expected = create_compressible_fixed_table<int>(16, 4 * 1024 * 1024, 6, true);
 
   // write out using the custom sink (which uses device writes)
-  cudf_io::write_parquet_args args{cudf_io::sink_info{&custom_sink}, *expected};
+  cudf_io::parquet_writer_options args =
+    cudf_io::parquet_writer_options::builder(cudf_io::sink_info{&custom_sink}, *expected);
   cudf_io::write_parquet(args);
 
-  cudf_io::read_parquet_args custom_args{cudf_io::source_info{mm_buf.data(), mm_buf.size()}};
+  cudf_io::parquet_reader_options custom_args =
+    cudf_io::parquet_reader_options::builder(cudf_io::source_info{mm_buf.data(), mm_buf.size()});
   auto custom_tbl = cudf_io::read_parquet(custom_args);
-  expect_tables_equal(custom_tbl.tbl->view(), expected->view());
+  CUDF_TEST_EXPECT_TABLES_EQUAL(custom_tbl.tbl->view(), expected->view());
 }
 
 TEST_F(ParquetWriterStressTest, DeviceWriteLargeTableWeakCompression)
@@ -1018,12 +1124,14 @@ TEST_F(ParquetWriterStressTest, DeviceWriteLargeTableWeakCompression)
   auto expected = create_random_fixed_table<int>(16, 4 * 1024 * 1024, false);
 
   // write out using the custom sink (which uses device writes)
-  cudf_io::write_parquet_args args{cudf_io::sink_info{&custom_sink}, *expected};
+  cudf_io::parquet_writer_options args =
+    cudf_io::parquet_writer_options::builder(cudf_io::sink_info{&custom_sink}, *expected);
   cudf_io::write_parquet(args);
 
-  cudf_io::read_parquet_args custom_args{cudf_io::source_info{mm_buf.data(), mm_buf.size()}};
+  cudf_io::parquet_reader_options custom_args =
+    cudf_io::parquet_reader_options::builder(cudf_io::source_info{mm_buf.data(), mm_buf.size()});
   auto custom_tbl = cudf_io::read_parquet(custom_args);
-  expect_tables_equal(custom_tbl.tbl->view(), expected->view());
+  CUDF_TEST_EXPECT_TABLES_EQUAL(custom_tbl.tbl->view(), expected->view());
 }
 
 TEST_F(ParquetWriterStressTest, DeviceWriteLargeTableGoodCompression)
@@ -1039,12 +1147,14 @@ TEST_F(ParquetWriterStressTest, DeviceWriteLargeTableGoodCompression)
   auto expected = create_compressible_fixed_table<int>(16, 4 * 1024 * 1024, 128 * 1024, false);
 
   // write out using the custom sink (which uses device writes)
-  cudf_io::write_parquet_args args{cudf_io::sink_info{&custom_sink}, *expected};
+  cudf_io::parquet_writer_options args =
+    cudf_io::parquet_writer_options::builder(cudf_io::sink_info{&custom_sink}, *expected);
   cudf_io::write_parquet(args);
 
-  cudf_io::read_parquet_args custom_args{cudf_io::source_info{mm_buf.data(), mm_buf.size()}};
+  cudf_io::parquet_reader_options custom_args =
+    cudf_io::parquet_reader_options::builder(cudf_io::source_info{mm_buf.data(), mm_buf.size()});
   auto custom_tbl = cudf_io::read_parquet(custom_args);
-  expect_tables_equal(custom_tbl.tbl->view(), expected->view());
+  CUDF_TEST_EXPECT_TABLES_EQUAL(custom_tbl.tbl->view(), expected->view());
 }
 
 TEST_F(ParquetWriterStressTest, DeviceWriteLargeTableWithValids)
@@ -1060,12 +1170,206 @@ TEST_F(ParquetWriterStressTest, DeviceWriteLargeTableWithValids)
   auto expected = create_compressible_fixed_table<int>(16, 4 * 1024 * 1024, 6, true);
 
   // write out using the custom sink (which uses device writes)
-  cudf_io::write_parquet_args args{cudf_io::sink_info{&custom_sink}, *expected};
+  cudf_io::parquet_writer_options args =
+    cudf_io::parquet_writer_options::builder(cudf_io::sink_info{&custom_sink}, *expected);
   cudf_io::write_parquet(args);
 
-  cudf_io::read_parquet_args custom_args{cudf_io::source_info{mm_buf.data(), mm_buf.size()}};
+  cudf_io::parquet_reader_options custom_args =
+    cudf_io::parquet_reader_options::builder(cudf_io::source_info{mm_buf.data(), mm_buf.size()});
   auto custom_tbl = cudf_io::read_parquet(custom_args);
-  expect_tables_equal(custom_tbl.tbl->view(), expected->view());
+  CUDF_TEST_EXPECT_TABLES_EQUAL(custom_tbl.tbl->view(), expected->view());
+}
+
+TEST_F(ParquetReaderTest, UserBounds)
+{
+  // trying to read more rows than there are should result in
+  // receiving the properly capped # of rows
+  {
+    srand(31337);
+    auto expected = create_random_fixed_table<int>(4, 4, false);
+
+    auto filepath = temp_env->get_temp_filepath("TooManyRows.parquet");
+    cudf_io::parquet_writer_options args =
+      cudf_io::parquet_writer_options::builder(cudf_io::sink_info{filepath}, *expected);
+    cudf_io::write_parquet(args);
+
+    // attempt to read more rows than there actually are
+    cudf_io::parquet_reader_options read_opts =
+      cudf_io::parquet_reader_options::builder(cudf_io::source_info{filepath}).num_rows(16);
+    auto result = cudf_io::read_parquet(read_opts);
+
+    // we should only get back 4 rows
+    EXPECT_EQ(result.tbl->view().column(0).size(), 4);
+  }
+
+  // trying to read past the end of the # of actual rows should result
+  // in empty columns.
+  {
+    srand(31337);
+    auto expected = create_random_fixed_table<int>(4, 4, false);
+
+    auto filepath = temp_env->get_temp_filepath("PastBounds.parquet");
+    cudf_io::parquet_writer_options args =
+      cudf_io::parquet_writer_options::builder(cudf_io::sink_info{filepath}, *expected);
+    cudf_io::write_parquet(args);
+
+    // attempt to read more rows than there actually are
+    cudf_io::parquet_reader_options read_opts =
+      cudf_io::parquet_reader_options::builder(cudf_io::source_info{filepath}).skip_rows(4);
+    auto result = cudf_io::read_parquet(read_opts);
+
+    // we should get empty columns back
+    EXPECT_EQ(result.tbl->view().num_columns(), 4);
+    EXPECT_EQ(result.tbl->view().column(0).size(), 0);
+  }
+
+  // trying to read 0 rows should result in reading the whole file
+  // at the moment we get back 4.  when that bug gets fixed, this
+  // test can be flipped.
+  {
+    srand(31337);
+    auto expected = create_random_fixed_table<int>(4, 4, false);
+
+    auto filepath = temp_env->get_temp_filepath("ZeroRows.parquet");
+    cudf_io::parquet_writer_options args =
+      cudf_io::parquet_writer_options::builder(cudf_io::sink_info{filepath}, *expected);
+    cudf_io::write_parquet(args);
+
+    // attempt to read more rows than there actually are
+    cudf_io::parquet_reader_options read_opts =
+      cudf_io::parquet_reader_options::builder(cudf_io::source_info{filepath}).num_rows(0);
+    auto result = cudf_io::read_parquet(read_opts);
+
+    EXPECT_EQ(result.tbl->view().num_columns(), 4);
+    EXPECT_EQ(result.tbl->view().column(0).size(), 0);
+  }
+
+  // trying to read 0 rows past the end of the # of actual rows should result
+  // in empty columns.
+  {
+    srand(31337);
+    auto expected = create_random_fixed_table<int>(4, 4, false);
+
+    auto filepath = temp_env->get_temp_filepath("ZeroRowsPastBounds.parquet");
+    cudf_io::parquet_writer_options args =
+      cudf_io::parquet_writer_options::builder(cudf_io::sink_info{filepath}, *expected);
+    cudf_io::write_parquet(args);
+
+    // attempt to read more rows than there actually are
+    cudf_io::parquet_reader_options read_opts =
+      cudf_io::parquet_reader_options::builder(cudf_io::source_info{filepath})
+        .skip_rows(4)
+        .num_rows(0);
+    auto result = cudf_io::read_parquet(read_opts);
+
+    // we should get empty columns back
+    EXPECT_EQ(result.tbl->view().num_columns(), 4);
+    EXPECT_EQ(result.tbl->view().column(0).size(), 0);
+  }
+}
+
+TEST_F(ParquetReaderTest, ReorderedColumns)
+{
+  {
+    auto a = cudf::test::strings_column_wrapper{{"a", "", "c"}, {true, false, true}};
+    auto b = cudf::test::fixed_width_column_wrapper<int>{1, 2, 3};
+
+    cudf::table_view tbl{{a, b}};
+    auto filepath = temp_env->get_temp_filepath("ReorderedColumns.parquet");
+    cudf_io::table_metadata md;
+    md.column_names.push_back("a");
+    md.column_names.push_back("b");
+    cudf_io::parquet_writer_options opts =
+      cudf_io::parquet_writer_options::builder(cudf_io::sink_info{filepath}, tbl).metadata(&md);
+    cudf_io::write_parquet(opts);
+
+    // read them out of order
+    cudf_io::parquet_reader_options read_opts =
+      cudf_io::parquet_reader_options::builder(cudf_io::source_info{filepath}).columns({"b", "a"});
+    auto result = cudf_io::read_parquet(read_opts);
+
+    cudf::test::expect_columns_equal(result.tbl->view().column(0), b);
+    cudf::test::expect_columns_equal(result.tbl->view().column(1), a);
+  }
+
+  {
+    auto a = cudf::test::fixed_width_column_wrapper<int>{1, 2, 3};
+    auto b = cudf::test::strings_column_wrapper{{"a", "", "c"}, {true, false, true}};
+
+    cudf::table_view tbl{{a, b}};
+    auto filepath = temp_env->get_temp_filepath("ReorderedColumns2.parquet");
+    cudf_io::table_metadata md;
+    md.column_names.push_back("a");
+    md.column_names.push_back("b");
+    cudf_io::parquet_writer_options opts =
+      cudf_io::parquet_writer_options::builder(cudf_io::sink_info{filepath}, tbl).metadata(&md);
+    cudf_io::write_parquet(opts);
+
+    // read them out of order
+    cudf_io::parquet_reader_options read_opts =
+      cudf_io::parquet_reader_options::builder(cudf_io::source_info{filepath}).columns({"b", "a"});
+    auto result = cudf_io::read_parquet(read_opts);
+
+    cudf::test::expect_columns_equal(result.tbl->view().column(0), b);
+    cudf::test::expect_columns_equal(result.tbl->view().column(1), a);
+  }
+
+  auto a = cudf::test::fixed_width_column_wrapper<int>{1, 2, 3, 10, 20, 30};
+  auto b = cudf::test::strings_column_wrapper{{"a", "", "c", "cats", "dogs", "owls"},
+                                              {true, false, true, true, false, true}};
+  auto c = cudf::test::fixed_width_column_wrapper<int>{{15, 16, 17, 25, 26, 32},
+                                                       {false, true, true, true, true, false}};
+  auto d = cudf::test::strings_column_wrapper{"ducks", "sheep", "cows", "fish", "birds", "ants"};
+
+  cudf::table_view tbl{{a, b, c, d}};
+  auto filepath = temp_env->get_temp_filepath("ReorderedColumns3.parquet");
+  cudf_io::table_metadata md;
+  md.column_names.push_back("a");
+  md.column_names.push_back("b");
+  md.column_names.push_back("c");
+  md.column_names.push_back("d");
+  cudf_io::parquet_writer_options opts =
+    cudf_io::parquet_writer_options::builder(cudf_io::sink_info{filepath}, tbl).metadata(&md);
+  cudf_io::write_parquet(opts);
+
+  {
+    // read them out of order
+    cudf_io::parquet_reader_options read_opts =
+      cudf_io::parquet_reader_options::builder(cudf_io::source_info{filepath})
+        .columns({"d", "a", "b", "c"});
+    auto result = cudf_io::read_parquet(read_opts);
+
+    cudf::test::expect_columns_equal(result.tbl->view().column(0), d);
+    cudf::test::expect_columns_equal(result.tbl->view().column(1), a);
+    cudf::test::expect_columns_equal(result.tbl->view().column(2), b);
+    cudf::test::expect_columns_equal(result.tbl->view().column(3), c);
+  }
+
+  {
+    // read them out of order
+    cudf_io::parquet_reader_options read_opts =
+      cudf_io::parquet_reader_options::builder(cudf_io::source_info{filepath})
+        .columns({"c", "d", "a", "b"});
+    auto result = cudf_io::read_parquet(read_opts);
+
+    cudf::test::expect_columns_equal(result.tbl->view().column(0), c);
+    cudf::test::expect_columns_equal(result.tbl->view().column(1), d);
+    cudf::test::expect_columns_equal(result.tbl->view().column(2), a);
+    cudf::test::expect_columns_equal(result.tbl->view().column(3), b);
+  }
+
+  {
+    // read them out of order
+    cudf_io::parquet_reader_options read_opts =
+      cudf_io::parquet_reader_options::builder(cudf_io::source_info{filepath})
+        .columns({"d", "c", "b", "a"});
+    auto result = cudf_io::read_parquet(read_opts);
+
+    cudf::test::expect_columns_equal(result.tbl->view().column(0), d);
+    cudf::test::expect_columns_equal(result.tbl->view().column(1), c);
+    cudf::test::expect_columns_equal(result.tbl->view().column(2), b);
+    cudf::test::expect_columns_equal(result.tbl->view().column(3), a);
+  }
 }
 
 CUDF_TEST_PROGRAM_MAIN()

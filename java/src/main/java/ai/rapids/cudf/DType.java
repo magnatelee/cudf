@@ -63,7 +63,9 @@ public enum DType {
   DURATION_NANOSECONDS(8, 21, "int64"),
   //DICTIONARY32(4, 22, "NO IDEA"),
 
-  STRING(0, 23, "str");
+  STRING(0, 23, "str"),
+  LIST(0, 24, "list"),
+  STRUCT(0, 27, "struct");
 
   private static final DType[] D_TYPES = DType.values();
   final int sizeInBytes;
@@ -122,6 +124,13 @@ public enum DType {
    */
   public boolean isDurationType() {
     return DURATION_TYPE.contains(this);
+  }
+
+  /**
+   * Returns true for nested types
+   */
+  public boolean isNestedType() {
+    return NESTED_TYPE.contains(this);
   }
 
   public int getNativeId() {
@@ -185,5 +194,10 @@ public enum DType {
       DType.UINT32,
       DType.DURATION_DAYS,
       DType.TIMESTAMP_DAYS
+  );
+
+  private static final EnumSet<DType> NESTED_TYPE = EnumSet.of(
+      DType.LIST,
+      DType.STRUCT
   );
 }

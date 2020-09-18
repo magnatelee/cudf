@@ -1,10 +1,8 @@
 # Copyright (c) 2018-2020, NVIDIA CORPORATION.
 import pickle
 
-import cupy
 import numpy as np
 import pandas as pd
-import pyarrow as pa
 
 import cudf
 from cudf import _lib as libcudf
@@ -87,9 +85,7 @@ class CategoricalAccessor(ColumnMethodsMixin):
         """
         The categories of this categorical.
         """
-        from cudf.core.index import as_index
-
-        return as_index(self._column.categories)
+        return cudf.core.index.as_index(self._column.categories)
 
     @property
     def codes(self):
@@ -676,9 +672,9 @@ class CategoricalAccessor(ColumnMethodsMixin):
         )
         out_code_dtype = min_unsigned_type(max_cat_size)
 
-        cur_order = cupy.arange(len(cur_codes))
-        old_codes = cupy.arange(len(cur_cats), dtype=out_code_dtype)
-        new_codes = cupy.arange(len(new_cats), dtype=out_code_dtype)
+        cur_order = column.arange(len(cur_codes))
+        old_codes = column.arange(len(cur_cats), dtype=out_code_dtype)
+        new_codes = column.arange(len(new_cats), dtype=out_code_dtype)
 
         new_df = cudf.DataFrame({"new_codes": new_codes, "cats": new_cats})
         old_df = cudf.DataFrame({"old_codes": old_codes, "cats": cur_cats})
@@ -897,9 +893,8 @@ class CategoricalColumn(column.ColumnBase):
         return self.as_numerical.binary_operator(op, rhs.as_numerical)
 
     def normalize_binop_value(self, other):
-        from cudf.utils import utils
 
-        ary = utils.scalar_broadcast_to(
+        ary = cudf.utils.utils.scalar_broadcast_to(
             self._encode(other), size=len(self), dtype=self.codes.dtype
         )
         col = column.build_categorical_column(
@@ -941,15 +936,6 @@ class CategoricalColumn(column.ColumnBase):
             codes, categories=categories, ordered=self.ordered
         )
         return pd.Series(data, index=index)
-
-    def to_arrow(self):
-        signed_codes_dtypes = min_signed_type(len(self.categories))
-        return pa.DictionaryArray.from_arrays(
-            from_pandas=True,
-            ordered=self.ordered,
-            indices=self.as_numerical.astype(signed_codes_dtypes).to_arrow(),
-            dictionary=self.categories.to_arrow(),
-        )
 
     @property
     def values_host(self):
@@ -1088,7 +1074,7 @@ class CategoricalColumn(column.ColumnBase):
             codes=column.as_column(result.base_data, dtype=result.dtype),
             offset=result.offset,
             size=result.size,
-            mask=None,
+            mask=result.base_mask,
             ordered=self.dtype.ordered,
         )
 
@@ -1163,6 +1149,11 @@ class CategoricalColumn(column.ColumnBase):
             dtype, **kwargs
         )
 
+    def as_timedelta_column(self, dtype, **kwargs):
+        return self._get_decategorized_column().as_timedelta_column(
+            dtype, **kwargs
+        )
+
     def _get_decategorized_column(self):
         if self.null_count == len(self):
             # self.categories is empty; just return codes
@@ -1175,9 +1166,10 @@ class CategoricalColumn(column.ColumnBase):
     def copy(self, deep=True):
         if deep:
             copied_col = libcudf.copying.copy_column(self)
+            copied_cat = libcudf.copying.copy_column(self.dtype._categories)
 
             return column.build_categorical_column(
-                categories=self.dtype.categories,
+                categories=copied_cat,
                 codes=column.as_column(
                     copied_col.base_data, dtype=copied_col.dtype
                 ),

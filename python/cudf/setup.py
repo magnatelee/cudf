@@ -1,4 +1,4 @@
-# Copyright (c) 2018, NVIDIA CORPORATION.
+# Copyright (c) 2018-2020, NVIDIA CORPORATION.
 import os
 import shutil
 import sysconfig
@@ -62,7 +62,7 @@ extensions = [
             pa.get_library_dirs()
             + [get_python_lib(), os.path.join(os.sys.prefix, "lib")]
         ),
-        libraries=["cudf"] + pa.get_libraries(),
+        libraries=["cudf"] + pa.get_libraries() + ["arrow_cuda"],
         language="c++",
         extra_compile_args=["-std=c++14"],
     )
@@ -95,7 +95,7 @@ setup(
     ),
     packages=find_packages(include=["cudf", "cudf.*"]),
     package_data=dict.fromkeys(
-        find_packages(include=["cudf._lib*", "cudf._cuda*"]), ["*.pxd"],
+        find_packages(include=["cudf._lib*"]), ["*.pxd"],
     ),
     cmdclass=versioneer.get_cmdclass(),
     install_requires=install_requires,

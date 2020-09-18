@@ -525,3 +525,65 @@ def test_concat_empty_dataframes(df, other, ignore_index):
         assert_eq(
             expected, actual, check_index_type=False if gdf.empty else True
         )
+
+
+@pytest.mark.parametrize("ignore_index", [True, False])
+@pytest.mark.parametrize("axis", [0, "index"])
+@pytest.mark.parametrize(
+    "data",
+    [
+        (["a", "b", "c"], ["a", "b", "c"]),
+        (["a", "b", "c"], ["XX", "YY", "ZZ"]),
+    ],
+)
+def test_concat_empty_and_nonempty_series(ignore_index, data, axis):
+    s1 = gd.Series()
+    s2 = gd.Series(data[0])
+    ps1 = s1.to_pandas()
+    ps2 = s2.to_pandas()
+    got = gd.concat([s1, s2], axis=axis, ignore_index=ignore_index)
+    expect = pd.concat([ps1, ps2], axis=axis, ignore_index=ignore_index)
+
+    assert_eq(got, expect)
+
+
+@pytest.mark.parametrize("ignore_index", [True, False])
+@pytest.mark.parametrize("axis", [0, "index"])
+def test_concat_two_empty_series(ignore_index, axis):
+    s1 = gd.Series()
+    s2 = gd.Series()
+    ps1 = s1.to_pandas()
+    ps2 = s2.to_pandas()
+    got = gd.concat([s1, s2], axis=axis, ignore_index=ignore_index)
+    expect = pd.concat([ps1, ps2], axis=axis, ignore_index=ignore_index)
+
+    assert_eq(got, expect)
+
+
+@pytest.mark.parametrize(
+    "df1,df2",
+    [
+        (
+            gd.DataFrame({"k1": [0, 1], "k2": [2, 3], "v1": [4, 5]}),
+            gd.DataFrame({"k1": [1, 0], "k2": [3, 2], "v2": [6, 7]}),
+        ),
+        (
+            gd.DataFrame({"k1": [0, 1], "k2": [2, 3], "v1": [4, 5]}),
+            gd.DataFrame({"k1": [0, 1], "k2": [3, 2], "v2": [6, 7]}),
+        ),
+    ],
+)
+def test_concat_dataframe_with_multiIndex(df1, df2):
+    gdf1 = df1
+    gdf1 = gdf1.set_index(["k1", "k2"])
+
+    gdf2 = df2
+    gdf2 = gdf2.set_index(["k1", "k2"])
+
+    pdf1 = gdf1.to_pandas()
+    pdf2 = gdf2.to_pandas()
+
+    expected = gd.concat([gdf1, gdf2], axis=1)
+    actual = pd.concat([pdf1, pdf2], axis=1)
+
+    assert_eq(expected, actual)

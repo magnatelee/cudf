@@ -28,6 +28,7 @@
 #include <cudf/stream_compaction.hpp>
 #include <cudf/strings/detail/scatter.cuh>
 #include <cudf/strings/string_view.cuh>
+#include <cudf/structs/struct_view.hpp>
 #include <cudf/table/table_device_view.cuh>
 #include <cudf/utilities/traits.hpp>
 
@@ -189,6 +190,19 @@ struct column_scalar_scatterer_impl<list_view, MapIterator> {
 };
 
 template <typename MapIterator>
+struct column_scalar_scatterer_impl<struct_view, MapIterator> {
+  std::unique_ptr<column> operator()(std::unique_ptr<scalar> const& source,
+                                     MapIterator scatter_iter,
+                                     size_type scatter_rows,
+                                     column_view const& target,
+                                     rmm::mr::device_memory_resource* mr,
+                                     cudaStream_t stream) const
+  {
+    CUDF_FAIL("scatter scalar to struct_view not implemented");
+  }
+};
+
+template <typename MapIterator>
 struct column_scalar_scatterer {
   template <typename Element>
   std::unique_ptr<column> operator()(std::unique_ptr<scalar> const& source,
@@ -338,7 +352,7 @@ std::unique_ptr<column> boolean_mask_scatter(column_view const& input,
 
   // The scatter map is actually a table with only one column, which is scatter map.
   auto scatter_map = detail::apply_boolean_mask(
-    table_view{{indices->view()}}, boolean_mask, rmm::mr::get_default_resource(), stream);
+    table_view{{indices->view()}}, boolean_mask, rmm::mr::get_current_device_resource(), stream);
   auto output_table = detail::scatter(table_view{{input}},
                                       scatter_map->get_column(0).view(),
                                       table_view{{target}},

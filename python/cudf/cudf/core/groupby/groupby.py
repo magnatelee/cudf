@@ -2,6 +2,7 @@
 import collections
 import functools
 import pickle
+import warnings
 
 import pandas as pd
 
@@ -13,6 +14,9 @@ from cudf.utils.utils import cached_property
 
 
 class GroupBy(Serializable):
+
+    _MAX_GROUPS_BEFORE_WARN = 100
+
     def __init__(
         self, obj, by=None, level=None, sort=True, as_index=True, dropna=True
     ):
@@ -63,11 +67,29 @@ class GroupBy(Serializable):
             raise
 
     def __iter__(self):
-        group_names, offsets, grouped_values = self._grouped()
+        group_names, offsets, grouped_keys, grouped_values = self._grouped()
         if isinstance(group_names, cudf.Index):
             group_names = group_names.to_pandas()
         for i, name in enumerate(group_names):
             yield name, grouped_values[offsets[i] : offsets[i + 1]]
+
+    @cached_property
+    def groups(self):
+        """
+        Returns a dictionary mapping group keys to row labels.
+        """
+        group_names, offsets, _, grouped_values = self._grouped()
+        grouped_index = grouped_values.index
+
+        if len(group_names) > self._MAX_GROUPS_BEFORE_WARN:
+            warnings.warn(
+                f"GroupBy.groups() performance scales poorly with "
+                f"number of groups. Got {len(group_names)} groups."
+            )
+
+        return dict(
+            zip(group_names.to_pandas(), grouped_index._split(offsets[1:-1]))
+        )
 
     def size(self):
         """
@@ -172,7 +194,7 @@ class GroupBy(Serializable):
 
         # copy categorical information from keys to the result index:
         result.index._copy_categories(self.grouping.keys)
-        result._index = cudf.core.index.as_index(result._index)
+        result._index = cudf.core.index.Index._from_table(result._index)
 
         if not self._as_index:
             for col_name in reversed(self.grouping._named_columns):
@@ -194,13 +216,6 @@ class GroupBy(Serializable):
         result = self.agg(lambda x: x.nth(n))
         sizes = self.size()
         return result[n < sizes]
-
-    def nunique(self):
-        """
-        Return the number of unique values per group.
-        """
-        # Pandas includes key columns for nunique:
-        return self.agg(dict.fromkeys(self.obj._data.keys(), "nunique"))
 
     def serialize(self):
         header = {}
@@ -245,7 +260,7 @@ class GroupBy(Serializable):
         grouped_values = self.obj.__class__._from_table(grouped_values)
         grouped_values._copy_categories(self.obj)
         group_names = grouped_keys.unique()
-        return (group_names, offsets, grouped_values)
+        return (group_names, offsets, grouped_keys, grouped_values)
 
     def _agg_func_name_with_args(self, func_name, *args, **kwargs):
         """
@@ -334,7 +349,15 @@ class GroupBy(Serializable):
         """
         if not callable(function):
             raise TypeError("type {!r} is not callable", type(function))
-        _, offsets, grouped_values = self._grouped()
+        _, offsets, _, grouped_values = self._grouped()
+
+        ngroups = len(offsets) - 1
+        if ngroups > self._MAX_GROUPS_BEFORE_WARN:
+            warnings.warn(
+                f"GroupBy.apply() performance scales poorly with "
+                f"number of groups. Got {ngroups} groups."
+            )
+
         chunks = [
             grouped_values[s:e] for s, e in zip(offsets[:-1], offsets[1:])
         ]
@@ -477,7 +500,7 @@ class GroupBy(Serializable):
         if not callable(function):
             raise TypeError("type {!r} is not callable", type(function))
 
-        _, offsets, grouped_values = self._grouped()
+        _, offsets, _, grouped_values = self._grouped()
         kwargs.update({"chunks": offsets})
         return grouped_values.apply_chunks(function, **kwargs)
 
@@ -599,6 +622,12 @@ class DataFrameGroupBy(GroupBy):
 
     def __getitem__(self, key):
         return self.obj[key].groupby(self.grouping, dropna=self._dropna)
+
+    def nunique(self):
+        """
+        Return the number of unique values per group
+        """
+        return self.agg("nunique")
 
 
 class SeriesGroupBy(GroupBy):

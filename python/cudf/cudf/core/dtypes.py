@@ -25,7 +25,7 @@ class CategoricalDtype(ExtensionDtype):
             return cudf.core.index.as_index(
                 cudf.core.column.column_empty(0, dtype="object", masked=False)
             )
-        return cudf.core.index.as_index(self._categories)
+        return cudf.core.index.as_index(self._categories, copy=False)
 
     @property
     def type(self):
@@ -110,6 +110,9 @@ class CategoricalDtype(ExtensionDtype):
 
 
 class ListDtype(ExtensionDtype):
+
+    name = "list"
+
     def __init__(self, element_type):
         if isinstance(element_type, ListDtype):
             self._typ = pa.list_(element_type._typ)
@@ -138,10 +141,6 @@ class ListDtype(ExtensionDtype):
         # TODO: we should change this to return something like a
         # ListDtypeType, once we figure out what that should look like
         return pa.array
-
-    @property
-    def name(self):
-        return "list"
 
     @classmethod
     def from_arrow(cls, typ):

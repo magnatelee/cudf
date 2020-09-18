@@ -46,10 +46,10 @@ TYPED_TEST(GatherTest, IdentityTest)
   std::unique_ptr<cudf::table> result = std::move(cudf::gather(source_table, gather_map));
 
   for (auto i = 0; i < source_table.num_columns(); ++i) {
-    cudf::test::expect_columns_equal(source_table.column(i), result->view().column(i));
+    CUDF_TEST_EXPECT_COLUMNS_EQUAL(source_table.column(i), result->view().column(i));
   }
 
-  cudf::test::expect_tables_equal(source_table, result->view());
+  CUDF_TEST_EXPECT_TABLES_EQUAL(source_table, result->view());
 }
 
 TYPED_TEST(GatherTest, ReverseIdentityTest)
@@ -71,7 +71,7 @@ TYPED_TEST(GatherTest, ReverseIdentityTest)
                                                                   reversed_data + source_size);
 
   for (auto i = 0; i < source_table.num_columns(); ++i) {
-    cudf::test::expect_columns_equal(expect_column, result->view().column(i));
+    CUDF_TEST_EXPECT_COLUMNS_EQUAL(expect_column, result->view().column(i));
   }
 }
 
@@ -102,7 +102,7 @@ TYPED_TEST(GatherTest, EveryOtherNullOdds)
     expect_data, expect_data + source_size / 2, expect_valid);
 
   for (auto i = 0; i < source_table.num_columns(); ++i) {
-    cudf::test::expect_columns_equal(expect_column, result->view().column(i));
+    CUDF_TEST_EXPECT_COLUMNS_EQUAL(expect_column, result->view().column(i));
   }
 }
 
@@ -134,7 +134,7 @@ TYPED_TEST(GatherTest, EveryOtherNullEvens)
     expect_data, expect_data + source_size / 2, expect_valid);
 
   for (auto i = 0; i < source_table.num_columns(); ++i) {
-    cudf::test::expect_columns_equal(expect_column, result->view().column(i));
+    CUDF_TEST_EXPECT_COLUMNS_EQUAL(expect_column, result->view().column(i));
   }
 }
 
@@ -151,18 +151,18 @@ TYPED_TEST(GatherTest, AllNull)
   std::iota(host_map_data.begin(), host_map_data.end(), 0);
   std::mt19937 g(0);
   std::shuffle(host_map_data.begin(), host_map_data.end(), g);
-  thrust::device_vector<cudf::size_type> map_data(host_map_data);
 
   cudf::test::fixed_width_column_wrapper<TypeParam> source_column{
     data, data + source_size, validity};
-  cudf::test::fixed_width_column_wrapper<int32_t> gather_map(map_data.begin(), map_data.end());
+  cudf::test::fixed_width_column_wrapper<int32_t> gather_map(host_map_data.begin(),
+                                                             host_map_data.end());
 
   cudf::table_view source_table({source_column});
 
   std::unique_ptr<cudf::table> result = std::move(cudf::gather(source_table, gather_map));
 
   // Check that the result is also all invalid
-  cudf::test::expect_tables_equal(source_table, result->view());
+  CUDF_TEST_EXPECT_TABLES_EQUAL(source_table, result->view());
 }
 
 TYPED_TEST(GatherTest, MultiColReverseIdentityTest)
@@ -195,7 +195,7 @@ TYPED_TEST(GatherTest, MultiColReverseIdentityTest)
                                                                   reversed_data + source_size);
 
   for (auto i = 0; i < source_table.num_columns(); ++i) {
-    cudf::test::expect_columns_equal(expect_column, result->view().column(i));
+    CUDF_TEST_EXPECT_COLUMNS_EQUAL(expect_column, result->view().column(i));
   }
 }
 
@@ -239,6 +239,6 @@ TYPED_TEST(GatherTest, MultiColNulls)
     expect_data, expect_data + source_size, expect_valid);
 
   for (auto i = 0; i < source_table.num_columns(); ++i) {
-    cudf::test::expect_columns_equal(expect_column, result->view().column(i));
+    CUDF_TEST_EXPECT_COLUMNS_EQUAL(expect_column, result->view().column(i));
   }
 }
