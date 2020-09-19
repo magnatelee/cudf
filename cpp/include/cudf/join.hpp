@@ -450,8 +450,8 @@ class hash_join {
     std::vector<std::pair<cudf::size_type, cudf::size_type>> const& columns_in_common,
     common_columns_output_side common_columns_output_side = common_columns_output_side::PROBE,
     null_equality compare_nulls                           = null_equality::EQUAL,
-    rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource(),
-    cudaStream_t stream = 0) const;
+    rmm::mr::device_memory_resource* mr                   = rmm::mr::get_current_device_resource(),
+    cudaStream_t stream                                   = 0) const;
 
   /**
    * @brief Performs a left join by probing in the internal hash table.
@@ -480,7 +480,7 @@ class hash_join {
     std::vector<std::pair<cudf::size_type, cudf::size_type>> const& columns_in_common,
     null_equality compare_nulls         = null_equality::EQUAL,
     rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource(),
-    cudaStream_t stream = 0) const;
+    cudaStream_t stream                 = 0) const;
 
   /**
    * @brief Performs a full join by probing in the internal hash table.
@@ -509,7 +509,7 @@ class hash_join {
     std::vector<std::pair<cudf::size_type, cudf::size_type>> const& columns_in_common,
     null_equality compare_nulls         = null_equality::EQUAL,
     rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource(),
-    cudaStream_t stream = 0) const;
+    cudaStream_t stream                 = 0) const;
 
  private:
   struct hash_join_impl;

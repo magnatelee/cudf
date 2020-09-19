@@ -520,8 +520,14 @@ std::unique_ptr<cudf::table> hash_join::hash_join_impl::left_join(
   cudaStream_t stream) const
 {
   CUDF_FUNC_RANGE();
-  auto probe_build_pair = compute_hash_join<cudf::detail::join_kind::LEFT_JOIN>(
-    probe, probe_on, columns_in_common, common_columns_output_side::PROBE, compare_nulls, mr, stream);
+  auto probe_build_pair =
+    compute_hash_join<cudf::detail::join_kind::LEFT_JOIN>(probe,
+                                                          probe_on,
+                                                          columns_in_common,
+                                                          common_columns_output_side::PROBE,
+                                                          compare_nulls,
+                                                          mr,
+                                                          stream);
   return cudf::detail::combine_table_pair(std::move(probe_build_pair.first),
                                           std::move(probe_build_pair.second));
 }
@@ -535,8 +541,14 @@ std::unique_ptr<cudf::table> hash_join::hash_join_impl::full_join(
   cudaStream_t stream) const
 {
   CUDF_FUNC_RANGE();
-  auto probe_build_pair = compute_hash_join<cudf::detail::join_kind::FULL_JOIN>(
-    probe, probe_on, columns_in_common, common_columns_output_side::PROBE, compare_nulls, mr, stream);
+  auto probe_build_pair =
+    compute_hash_join<cudf::detail::join_kind::FULL_JOIN>(probe,
+                                                          probe_on,
+                                                          columns_in_common,
+                                                          common_columns_output_side::PROBE,
+                                                          compare_nulls,
+                                                          mr,
+                                                          stream);
   return cudf::detail::combine_table_pair(std::move(probe_build_pair.first),
                                           std::move(probe_build_pair.second));
 }
