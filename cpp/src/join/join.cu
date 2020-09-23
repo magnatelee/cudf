@@ -79,7 +79,7 @@ std::unique_ptr<table> left_join(
 {
   CUDF_FUNC_RANGE();
   cudf::hash_join hj_obj(right, right_on);
-  return hj_obj.left_join(left, left_on, columns_in_common, compare_nulls, mr);
+  return hj_obj.left_join(left, left_on, columns_in_common, compare_nulls, mr, stream);
 }
 
 std::unique_ptr<table> full_join(
@@ -94,7 +94,7 @@ std::unique_ptr<table> full_join(
 {
   CUDF_FUNC_RANGE();
   cudf::hash_join hj_obj(right, right_on);
-  return hj_obj.full_join(left, left_on, columns_in_common, compare_nulls, mr);
+  return hj_obj.full_join(left, left_on, columns_in_common, compare_nulls, mr, stream);
 }
 
 hash_join::~hash_join() = default;
