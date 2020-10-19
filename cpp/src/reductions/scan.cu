@@ -98,8 +98,9 @@ struct ScanDispatcher {
       thrust::find_if_not(
         rmm::exec_policy(stream)->on(stream), v, v + input_view.size(), thrust::identity<bool>{}) -
       v;
-    cudf::set_null_mask(
-      static_cast<cudf::bitmask_type*>(mask.data()), 0, first_null_position, true);
+    if (0 < first_null_position)
+      cudf::set_null_mask(
+        static_cast<cudf::bitmask_type*>(mask.data()), 0, first_null_position, true);
     cudf::set_null_mask(
       static_cast<cudf::bitmask_type*>(mask.data()), first_null_position, input_view.size(), false);
     return mask;
