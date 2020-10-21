@@ -22,8 +22,10 @@
 
 namespace cudf {
 /**
- * @ingroup column_factories Factories
+ * @addtogroup column_factories
  * @{
+ * @file
+ * @brief Column factory APIs
  */
 
 /**
@@ -86,7 +88,61 @@ std::unique_ptr<column> make_numeric_column(
   cudaStream_t stream                 = 0,
   rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource())
 {
-  CUDF_EXPECTS(is_numeric(type) || is_fixed_point(type), "Invalid, non-numeric type.");
+  CUDF_EXPECTS(is_numeric(type), "Invalid, non-numeric type.");
+  return std::make_unique<column>(type,
+                                  size,
+                                  rmm::device_buffer{size * cudf::size_of(type), stream, mr},
+                                  std::forward<B>(null_mask),
+                                  null_count);
+}
+
+/**
+ * @brief Construct column with sufficient uninitialized storage to hold `size` elements of the
+ * specified `fixed_point` `data_type` with an optional null mask.
+ *
+ * @note The column's null count is determined by the requested null mask `state`.
+ *
+ * @throws cudf::logic_error if `type` is not a `fixed_point` type.
+ *
+ * @param[in] type The desired `fixed_point` element type.
+ * @param[in] size The number of elements in the column.
+ * @param[in] state Optional, controls allocation/initialization of the.
+ * column's null mask. By default, no null mask is allocated.
+ * @param[in] stream CUDA stream used for device memory operations and kernel launches.
+ * @param[in] mr Device memory resource used to allocate the returned column's device memory.
+ */
+std::unique_ptr<column> make_fixed_point_column(
+  data_type type,
+  size_type size,
+  mask_state state                    = mask_state::UNALLOCATED,
+  cudaStream_t stream                 = 0,
+  rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource());
+
+/**
+ * @brief Construct column with sufficient uninitialized storage to hold `size` elements of the
+ * specified `fixed_point` `data_type` with a null mask.
+ *
+ * @note null_count is optional and will be computed if not provided.
+ *
+ * @throws cudf::logic_error if `type` is not a `fixed_point` type.
+ *
+ * @param[in] type The desired `fixed_point` element type.
+ * @param[in] size The number of elements in the column.
+ * @param[in] null_mask Null mask to use for this column.
+ * @param[in] null_count Optional number of nulls in the null_mask.
+ * @param[in] stream CUDA stream used for device memory operations and kernel launches.
+ * @param[in] mr Device memory resource used to allocate the returned column's device memory.
+ */
+template <typename B>
+std::unique_ptr<column> make_fixed_point_column(
+  data_type type,
+  size_type size,
+  B&& null_mask,
+  size_type null_count                = cudf::UNKNOWN_NULL_COUNT,
+  cudaStream_t stream                 = 0,
+  rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource())
+{
+  CUDF_EXPECTS(is_fixed_point(type), "Invalid, non-fixed_point type.");
   return std::make_unique<column>(type,
                                   size,
                                   rmm::device_buffer{size * cudf::size_of(type), stream, mr},
@@ -265,6 +321,8 @@ std::unique_ptr<column> make_fixed_width_column(
     return make_timestamp_column(type, size, std::forward<B>(null_mask), null_count, stream, mr);
   } else if (is_duration(type)) {
     return make_duration_column(type, size, std::forward<B>(null_mask), null_count, stream, mr);
+  } else if (is_fixed_point(type)) {
+    return make_fixed_point_column(type, size, std::forward<B>(null_mask), null_count, stream, mr);
   }
   return make_numeric_column(type, size, std::forward<B>(null_mask), null_count, stream, mr);
 }
@@ -547,6 +605,26 @@ std::unique_ptr<cudf::column> make_structs_column(
  * @param mr Device memory resource used to allocate the returned column's device memory.
  */
 std::unique_ptr<column> make_column_from_scalar(
+  scalar const& s,
+  size_type size,
+  rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource(),
+  cudaStream_t stream                 = 0);
+
+/**
+ * @brief Return a dictionary column with size elements that are all equal to the
+ * given scalar.
+ *
+ * The output column will have keys of type `s.type()`
+ * The output column will be empty if `size==0`.
+ *
+ * @throw cudf::logic_error if `s.is_valid()==false`
+ *
+ * @param s The scalar to use for values in the column.
+ * @param size The number of rows for the output column.
+ * @param stream CUDA stream used for device memory operations and kernel launches.
+ * @param mr Device memory resource used to allocate the returned column's device memory.
+ */
+std::unique_ptr<column> make_dictionary_from_scalar(
   scalar const& s,
   size_type size,
   rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource(),

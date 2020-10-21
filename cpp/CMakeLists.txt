@@ -448,8 +448,10 @@ add_library(cudf
             src/quantiles/quantile.cu
             src/quantiles/quantiles.cu
             src/reductions/reductions.cpp
+            src/reductions/nth_element.cu
             src/reductions/min.cu
             src/reductions/max.cu
+            src/reductions/minmax.cu
             src/reductions/any.cu
             src/reductions/all.cu
             src/reductions/sum.cu
@@ -489,6 +491,7 @@ add_library(cudf
             src/io/orc/reader_impl.cu
             src/io/orc/writer_impl.cu
             src/io/parquet/page_data.cu
+            src/io/parquet/compact_protocol_writer.cpp
             src/io/parquet/page_hdr.cu
             src/io/parquet/page_enc.cu
             src/io/parquet/page_dict.cu
@@ -523,6 +526,7 @@ add_library(cudf
             src/filling/fill.cu
             src/filling/repeat.cu
             src/filling/sequence.cu
+            src/reshape/byte_cast.cu
             src/reshape/tile.cu
             src/search/search.cu
             src/column/column.cu
@@ -612,6 +616,7 @@ add_library(cudf
             src/dictionary/decode.cu
             src/dictionary/encode.cu
             src/dictionary/remove_keys.cu
+            src/dictionary/replace.cu
             src/dictionary/search.cu
             src/dictionary/set_keys.cu
             src/groupby/groupby.cu
@@ -632,6 +637,9 @@ add_library(cudf
             src/aggregation/aggregation.cpp
             src/aggregation/aggregation.cu
             src/aggregation/result_cache.cpp
+            src/ast/transform.cu
+            src/ast/linearizer.cpp
+            src/utilities/default_stream.cpp
 )
 
 # Override RPATH for cudf
@@ -783,21 +791,16 @@ if(HT_DEFAULT_ALLOCATOR)
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -DHT_DEFAULT_ALLOCATOR")
 endif(HT_DEFAULT_ALLOCATOR)
 
-# Set a default logging level if none was specified
-set(DEFAULT_LOGGING_LEVEL INFO)
+###################################################################################################
+# - rmm logging level -----------------------------------------------------------------------------
 
-if(NOT LOGGING_LEVEL)
-    message(STATUS "Setting logging level to '${DEFAULT_LOGGING_LEVEL}' since none specified.")
-    set(LOGGING_LEVEL "${DEFAULT_LOGGING_LEVEL}" CACHE
-      STRING "Choose the logging level." FORCE)
-    # Set the possible values of build type for cmake-gui
-    set_property(CACHE LOGGING_LEVEL PROPERTY STRINGS
+set(RMM_LOGGING_LEVEL "INFO" CACHE STRING "Choose the logging level.")
+# Set the possible values of build type for cmake-gui
+set_property(CACHE RMM_LOGGING_LEVEL PROPERTY STRINGS
         "TRACE" "DEBUG" "INFO" "WARN" "ERROR" "CRITICAL" "OFF")
-else()
-    message(STATUS "Setting logging level to '${LOGGING_LEVEL}'")
-endif(NOT LOGGING_LEVEL)
+message(STATUS "RMM_LOGGING_LEVEL = '${RMM_LOGGING_LEVEL}'.")
 
-target_compile_definitions(cudf PUBLIC SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_${LOGGING_LEVEL})
+target_compile_definitions(cudf PUBLIC SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_${RMM_LOGGING_LEVEL})
 
 ###################################################################################################
 # - link libraries --------------------------------------------------------------------------------
@@ -813,6 +816,9 @@ install(TARGETS cudf
         DESTINATION lib
         COMPONENT cudf)
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/cudf
+        DESTINATION include
+        COMPONENT cudf)
+install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/cudf_test
         DESTINATION include
         COMPONENT cudf)
 

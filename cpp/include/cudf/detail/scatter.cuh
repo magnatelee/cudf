@@ -19,6 +19,7 @@
 #include <cudf/column/column_device_view.cuh>
 #include <cudf/copying.hpp>
 #include <cudf/detail/gather.cuh>
+#include <cudf/detail/indexalator.cuh>
 #include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/dictionary/detail/update_keys.hpp>
 #include <cudf/dictionary/dictionary_column_view.hpp>
@@ -86,13 +87,15 @@ struct column_scatterer_impl {
     auto result      = std::make_unique<column>(target, stream, mr);
     auto result_view = result->mutable_view();
 
+    using Type = device_storage_type_t<Element>;
+
     // NOTE use source.begin + scatter rows rather than source.end in case the
     // scatter map is smaller than the number of source rows
     thrust::scatter(rmm::exec_policy(stream)->on(stream),
-                    source.begin<Element>(),
-                    source.begin<Element>() + std::distance(scatter_map_begin, scatter_map_end),
+                    source.begin<Type>(),
+                    source.begin<Type>() + cudf::distance(scatter_map_begin, scatter_map_end),
                     scatter_map_begin,
-                    result_view.begin<Element>());
+                    result_view.begin<Type>());
 
     return result;
   }
@@ -158,17 +161,14 @@ struct column_scatterer_impl<dictionary32, MapIterator> {
     auto const source_view = dictionary_column_view(source_matched->view());
 
     // now build the new indices by doing a scatter on just the matched indices
-    column_view const source_indices = source_view.get_indices_annotated();
-    column_view const target_indices = target_view.get_indices_annotated();
-
-    auto new_indices = type_dispatcher(source_indices.type(),
-                                       column_scatterer<MapIterator>{},
-                                       source_indices,
-                                       scatter_map_begin,
-                                       scatter_map_end,
-                                       target_indices,
-                                       mr,
-                                       stream);
+    auto source_itr  = indexalator_factory::make_input_iterator(source_view.indices());
+    auto new_indices = std::make_unique<column>(target_view.get_indices_annotated(), stream, mr);
+    auto target_itr  = indexalator_factory::make_output_iterator(new_indices->mutable_view());
+    thrust::scatter(rmm::exec_policy(stream)->on(stream),
+                    source_itr,
+                    source_itr + std::distance(scatter_map_begin, scatter_map_end),
+                    scatter_map_begin,
+                    target_itr);
 
     // record some data before calling release()
     auto const indices_type = new_indices->type();

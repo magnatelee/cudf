@@ -30,6 +30,7 @@ namespace datetime {
 /**
  * @addtogroup datetime_extract
  * @{
+ * @file
  */
 
 /**
@@ -134,6 +135,7 @@ std::unique_ptr<cudf::column> extract_second(
 /**
  * @addtogroup datetime_compute
  * @{
+ * @file
  */
 
 /**

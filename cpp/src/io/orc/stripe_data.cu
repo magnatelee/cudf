@@ -793,11 +793,11 @@ static __device__ uint32_t Integer_RLEv2(
         }
       }
     }
-    base = shuffle(base);
-    mode = shuffle(mode);
-    pos  = shuffle(pos);
-    n    = shuffle(n);
-    w    = shuffle(w);
+    base = SHFL0(base);
+    mode = SHFL0(mode);
+    pos  = SHFL0(pos);
+    n    = SHFL0(n);
+    w    = SHFL0(w);
     for (uint32_t i = tr; i < n; i += 32) {
       if (sizeof(T) <= 4) {
         if (mode == 0) {
@@ -841,7 +841,7 @@ static __device__ uint32_t Integer_RLEv2(
         }
       }
     }
-    __syncwarp();
+    SYNCWARP();
     // Patch values
     if (mode == 2) {
       uint32_t pw_byte3 = rle->m2_pw_byte3[r];
@@ -861,17 +861,17 @@ static __device__ uint32_t Integer_RLEv2(
         patch <<= w;
         patch_pos = (uint32_t)(patch_pos64 >> pw);
         for (uint32_t k = 1; k < pll; k <<= 1) {
-          uint32_t tmp = shuffle(patch_pos, (tr & ~k) | (k - 1));
+          uint32_t tmp = SHFL(patch_pos, (tr & ~k) | (k - 1));
           patch_pos += (tr & k) ? tmp : 0;
         }
         if (tr < pll && patch_pos < n) { vals[base + patch_pos] += patch; }
       }
     }
-    __syncwarp();
+    SYNCWARP();
     if (mode == 3) {
       T baseval;
       for (uint32_t i = 1; i < n; i <<= 1) {
-        __syncwarp();
+        SYNCWARP();
         for (uint32_t j = tr; j < n; j += 32) {
           if (j & i) vals[base + j] += vals[base + ((j & ~i) | (i - 1))];
         }
@@ -1033,61 +1033,84 @@ static __device__ int Decode_Decimals(orc_bytestream_s *bs,
                                       int col_scale,
                                       int t)
 {
-  if (t == 0) {
-    uint32_t maxpos  = min(bs->len, bs->pos + (BYTESTREAM_BFRSZ - 8u));
-    uint32_t lastpos = bs->pos;
-    uint32_t n;
-    for (n = 0; n < numvals; n++) {
-      uint32_t pos                  = lastpos;
-      *(volatile int32_t *)&vals[n] = lastpos;
-      pos += varint_length<uint4>(bs, pos);
-      if (pos > maxpos) break;
-      lastpos = pos;
+  uint32_t num_vals_read = 0;
+  // Iterates till `numvals` are read or there is nothing to read once the
+  // stream has reached its end, and can't read anything more.
+  while (num_vals_read != numvals) {
+    if (t == 0) {
+      uint32_t maxpos  = min(bs->len, bs->pos + (BYTESTREAM_BFRSZ - 8u));
+      uint32_t lastpos = bs->pos;
+      uint32_t n;
+      for (n = num_vals_read; n < numvals; n++) {
+        uint32_t pos = lastpos;
+        pos += varint_length<uint4>(bs, pos);
+        if (pos > maxpos) break;
+        *reinterpret_cast<volatile int32_t *>(&vals[n]) = lastpos;
+        lastpos                                         = pos;
+      }
+      scratch->num_vals = n;
+      bytestream_flush_bytes(bs, lastpos - bs->pos);
     }
-    scratch->num_vals = n;
-    bytestream_flush_bytes(bs, lastpos - bs->pos);
-  }
-  __syncthreads();
-  numvals = scratch->num_vals;
-  if (t < numvals) {
-    int pos    = *(volatile int32_t *)&vals[t];
-    int128_s v = decode_varint128(bs, pos);
+    __syncthreads();
+    uint32_t num_vals_to_read = scratch->num_vals;
+    if (t >= num_vals_read and t < num_vals_to_read) {
+      int pos    = *reinterpret_cast<volatile int32_t *>(&vals[t]);
+      int128_s v = decode_varint128(bs, pos);
 
-    if (col_scale & ORC_DECIMAL2FLOAT64_SCALE) {
-      double f      = Int128ToDouble_rn(v.lo, v.hi);
-      int32_t scale = (t < numvals) ? val_scale : 0;
-      if (scale >= 0)
-        reinterpret_cast<volatile double *>(vals)[t] = f / kPow10[min(scale, 39)];
-      else
-        reinterpret_cast<volatile double *>(vals)[t] = f * kPow10[min(-scale, 39)];
-    } else {
-      int32_t scale = (t < numvals) ? (col_scale & ~ORC_DECIMAL2FLOAT64_SCALE) - val_scale : 0;
-      if (scale >= 0) {
-        scale   = min(scale, 27);
-        vals[t] = ((int64_t)v.lo * kPow5i[scale]) << scale;
-      } else  // if (scale < 0)
-      {
-        bool is_negative = (v.hi < 0);
-        uint64_t hi = v.hi, lo = v.lo;
-        scale = min(-scale, 27);
-        if (is_negative) {
-          hi = (~hi) + (lo == 0);
-          lo = (~lo) + 1;
+      if (col_scale & ORC_DECIMAL2FLOAT64_SCALE) {
+        double f      = Int128ToDouble_rn(v.lo, v.hi);
+        int32_t scale = (t < numvals) ? val_scale : 0;
+        if (scale >= 0)
+          reinterpret_cast<volatile double *>(vals)[t] = f / kPow10[min(scale, 39)];
+        else
+          reinterpret_cast<volatile double *>(vals)[t] = f * kPow10[min(-scale, 39)];
+      } else {
+        int32_t scale = (t < numvals) ? (col_scale & ~ORC_DECIMAL2FLOAT64_SCALE) - val_scale : 0;
+        if (scale >= 0) {
+          scale   = min(scale, 27);
+          vals[t] = ((int64_t)v.lo * kPow5i[scale]) << scale;
+        } else  // if (scale < 0)
+        {
+          bool is_negative = (v.hi < 0);
+          uint64_t hi = v.hi, lo = v.lo;
+          scale = min(-scale, 27);
+          if (is_negative) {
+            hi = (~hi) + (lo == 0);
+            lo = (~lo) + 1;
+          }
+          lo = (lo >> (uint32_t)scale) | ((uint64_t)hi << (64 - scale));
+          hi >>= (int32_t)scale;
+          if (hi != 0) {
+            // Use intermediate float
+            lo = __double2ull_rn(Int128ToDouble_rn(lo, hi) / __ll2double_rn(kPow5i[scale]));
+            hi = 0;
+          } else {
+            lo /= kPow5i[scale];
+          }
+          vals[t] = (is_negative) ? -(int64_t)lo : (int64_t)lo;
         }
-        lo = (lo >> (uint32_t)scale) | ((uint64_t)hi << (64 - scale));
-        hi >>= (int32_t)scale;
-        if (hi != 0) {
-          // Use intermediate float
-          lo = __double2ull_rn(Int128ToDouble_rn(lo, hi) / __ll2double_rn(kPow5i[scale]));
-          hi = 0;
-        } else {
-          lo /= kPow5i[scale];
-        }
-        vals[t] = (is_negative) ? -(int64_t)lo : (int64_t)lo;
       }
     }
+    // There is nothing to read, so break
+    if (num_vals_read == num_vals_to_read) break;
+
+    // Update number of values read (This contains values of previous iteration)
+    num_vals_read = num_vals_to_read;
+
+    // Have to wait till all threads have copied data
+    __syncthreads();
+    if (num_vals_read != numvals) {
+      bytestream_fill(bs, t);
+      __syncthreads();
+      if (t == 0) {
+        // Needs to be reset since bytestream has been filled
+        bs->fill_count = 0;
+      }
+    }
+    // Adding to get all threads in sync before next read
+    __syncthreads();
   }
-  return numvals;
+  return num_vals_read;
 }
 
 /**
@@ -1102,8 +1125,7 @@ static __device__ int Decode_Decimals(orc_bytestream_s *bs,
  *
  **/
 // blockDim {NTHREADS,1,1}
-template <int block_size>
-__global__ void __launch_bounds__(block_size)
+extern "C" __global__ void __launch_bounds__(NTHREADS)
   gpuDecodeNullsAndStringDictionaries(ColumnDesc *chunks,
                                       DictionaryEntry *global_dictionary,
                                       uint32_t num_columns,
@@ -1112,8 +1134,6 @@ __global__ void __launch_bounds__(block_size)
                                       size_t first_row)
 {
   __shared__ __align__(16) orcdec_state_s state_g;
-  using warp_reduce = cub::WarpReduce<uint32_t>;
-  __shared__ typename warp_reduce::TempStorage temp_storage[block_size / 32];
 
   orcdec_state_s *const s = &state_g;
   bool is_nulldec         = (blockIdx.y >= num_stripes);
@@ -1209,7 +1229,11 @@ __global__ void __launch_bounds__(block_size)
           if (i + 32 > skippedrows) { bits &= (1 << (skippedrows - i)) - 1; }
           skip_count += __popc(bits);
         }
-        skip_count = warp_reduce(temp_storage[threadIdx.x / 32]).Sum(skip_count);
+        skip_count += SHFL_XOR(skip_count, 1);
+        skip_count += SHFL_XOR(skip_count, 2);
+        skip_count += SHFL_XOR(skip_count, 4);
+        skip_count += SHFL_XOR(skip_count, 8);
+        skip_count += SHFL_XOR(skip_count, 16);
         if (t == 0) { s->chunk.skip_count += skip_count; }
       }
       __syncthreads();
@@ -1218,12 +1242,20 @@ __global__ void __launch_bounds__(block_size)
     }
     __syncthreads();
     // Sum up the valid counts and infer null_count
-    null_count = warp_reduce(temp_storage[threadIdx.x / 32]).Sum(null_count);
+    null_count += SHFL_XOR(null_count, 1);
+    null_count += SHFL_XOR(null_count, 2);
+    null_count += SHFL_XOR(null_count, 4);
+    null_count += SHFL_XOR(null_count, 8);
+    null_count += SHFL_XOR(null_count, 16);
     if (!(t & 0x1f)) { s->top.nulls.null_count[t >> 5] = null_count; }
     __syncthreads();
     if (t < 32) {
       null_count = (t < NWARPS) ? s->top.nulls.null_count[t] : 0;
-      null_count = warp_reduce(temp_storage[threadIdx.x / 32]).Sum(null_count);
+      null_count += SHFL_XOR(null_count, 1);
+      null_count += SHFL_XOR(null_count, 2);
+      null_count += SHFL_XOR(null_count, 4);
+      null_count += SHFL_XOR(null_count, 8);
+      null_count += SHFL_XOR(null_count, 16);
       if (t == 0) {
         chunks[chunk_id].null_count = null_count;
         chunks[chunk_id].skip_count = s->chunk.skip_count;
@@ -1235,9 +1267,9 @@ __global__ void __launch_bounds__(block_size)
     if ((encoding_kind == DICTIONARY || encoding_kind == DICTIONARY_V2) &&
         (s->chunk.dict_len > 0)) {
       if (t == 0) {
-        s->top.dict.dict_len = s->chunk.dict_len;
-        s->top.dict.local_dict =
-          (uint2 *)(global_dictionary + s->chunk.dictionary_start);  // Local dictionary
+        s->top.dict.dict_len   = s->chunk.dict_len;
+        s->top.dict.local_dict = reinterpret_cast<uint2 *>(
+          global_dictionary + s->chunk.dictionary_start);  // Local dictionary
         s->top.dict.dict_pos = 0;
         // CI_DATA2 contains the LENGTH stream coding the length of individual dictionary entries
         bytestream_init(&s->bs, s->chunk.streams[CI_DATA2], s->chunk.strm_len[CI_DATA2]);
@@ -1289,11 +1321,8 @@ __global__ void __launch_bounds__(block_size)
  * @param[in] t thread id
  *
  **/
-template <int block_size>
 static __device__ void DecodeRowPositions(orcdec_state_s *s, size_t first_row, int t)
 {
-  using warp_reduce = cub::WarpReduce<uint32_t>;
-  __shared__ typename warp_reduce::TempStorage temp_storage[block_size / 32];
   if (t == 0) {
     if (s->chunk.skip_count != 0) {
       s->u.rowdec.nz_count = min(min(s->chunk.skip_count, s->top.data.max_vals), NTHREADS);
@@ -1334,13 +1363,21 @@ static __device__ void DecodeRowPositions(orcdec_state_s *s, size_t first_row, i
       // TBD: Brute-forcing this, there might be a more efficient way to find the thread with the
       // last row
       last_row = (nz_count == s->u.rowdec.nz_count) ? row_plus1 : 0;
-      last_row = warp_reduce(temp_storage[threadIdx.x / 32]).Reduce(last_row, cub::Max());
+      last_row = max(last_row, SHFL_XOR(last_row, 1));
+      last_row = max(last_row, SHFL_XOR(last_row, 2));
+      last_row = max(last_row, SHFL_XOR(last_row, 4));
+      last_row = max(last_row, SHFL_XOR(last_row, 8));
+      last_row = max(last_row, SHFL_XOR(last_row, 16));
       if (!(t & 0x1f)) { *(volatile uint32_t *)&s->u.rowdec.last_row[t >> 5] = last_row; }
       nz_pos = (valid) ? nz_count : 0;
       __syncthreads();
       if (t < 32) {
         last_row = (t < NWARPS) ? *(volatile uint32_t *)&s->u.rowdec.last_row[t] : 0;
-        last_row = warp_reduce(temp_storage[threadIdx.x / 32]).Reduce(last_row, cub::Max());
+        last_row = max(last_row, SHFL_XOR(last_row, 1));
+        last_row = max(last_row, SHFL_XOR(last_row, 2));
+        last_row = max(last_row, SHFL_XOR(last_row, 4));
+        last_row = max(last_row, SHFL_XOR(last_row, 8));
+        last_row = max(last_row, SHFL_XOR(last_row, 16));
         if (t == 0) { s->top.data.nrows = last_row; }
       }
       if (valid && nz_pos - 1 < s->u.rowdec.nz_count) { s->u.rowdec.row[nz_pos - 1] = row_plus1; }
@@ -1435,8 +1472,7 @@ static const __device__ __constant__ uint32_t kTimestampNanoScale[8] = {
  *
  **/
 // blockDim {NTHREADS,1,1}
-template <int block_size>
-__global__ void __launch_bounds__(NTHREADS)
+extern "C" __global__ void __launch_bounds__(NTHREADS)
   gpuDecodeOrcColumnData(ColumnDesc *chunks,
                          DictionaryEntry *global_dictionary,
                          int64_t *tz_table,
@@ -1698,7 +1734,7 @@ __global__ void __launch_bounds__(NTHREADS)
       __syncthreads();
       // Use the valid bits to compute non-null row positions until we get a full batch of values to
       // decode
-      DecodeRowPositions<block_size>(s, first_row, t);
+      DecodeRowPositions(s, first_row, t);
       if (!s->top.data.nrows && !s->u.rowdec.nz_count && !vals_skipped) {
         // This is a bug (could happen with bitstream errors with a bad run that would produce more
         // values than the number of remaining rows)
@@ -1713,39 +1749,35 @@ __global__ void __launch_bounds__(NTHREADS)
           void *data_out = s->chunk.column_data_base;
           switch (s->chunk.type_kind) {
             case FLOAT:
-            case INT:
-              reinterpret_cast<uint32_t *>(data_out)[row] = s->vals.u32[t + vals_skipped];
-              break;
+            case INT: static_cast<uint32_t *>(data_out)[row] = s->vals.u32[t + vals_skipped]; break;
             case DOUBLE:
             case LONG:
             case DECIMAL:
-              reinterpret_cast<uint64_t *>(data_out)[row] = s->vals.u64[t + vals_skipped];
+              static_cast<uint64_t *>(data_out)[row] = s->vals.u64[t + vals_skipped];
               break;
             case SHORT:
-              reinterpret_cast<uint16_t *>(data_out)[row] =
+              static_cast<uint16_t *>(data_out)[row] =
                 static_cast<uint16_t>(s->vals.u32[t + vals_skipped]);
               break;
-            case BYTE:
-              reinterpret_cast<uint8_t *>(data_out)[row] = s->vals.u8[t + vals_skipped];
-              break;
+            case BYTE: static_cast<uint8_t *>(data_out)[row] = s->vals.u8[t + vals_skipped]; break;
             case BOOLEAN:
-              reinterpret_cast<uint8_t *>(data_out)[row] =
+              static_cast<uint8_t *>(data_out)[row] =
                 (s->vals.u8[(t + vals_skipped) >> 3] >> ((~t) & 7)) & 1;
               break;
             case DATE:
               if (s->chunk.dtype_len == 8) {
                 // Convert from days to milliseconds by multiplying by 24*3600*1000
-                reinterpret_cast<int64_t *>(data_out)[row] =
+                static_cast<int64_t *>(data_out)[row] =
                   86400000ll * (int64_t)s->vals.i32[t + vals_skipped];
               } else {
-                reinterpret_cast<uint32_t *>(data_out)[row] = s->vals.u32[t + vals_skipped];
+                static_cast<uint32_t *>(data_out)[row] = s->vals.u32[t + vals_skipped];
               }
               break;
             case STRING:
             case BINARY:
             case VARCHAR:
             case CHAR: {
-              nvstrdesc_s *strdesc = &reinterpret_cast<nvstrdesc_s *>(data_out)[row];
+              nvstrdesc_s *strdesc = &static_cast<nvstrdesc_s *>(data_out)[row];
               const uint8_t *ptr;
               uint32_t count;
               if (IS_DICTIONARY(s->chunk.encoding_kind)) {
@@ -1779,12 +1811,12 @@ __global__ void __launch_bounds__(NTHREADS)
               if (tz_len > 0) { seconds = ConvertToUTC(&s->top.data, tz_table, seconds); }
               if (seconds < 0 && nanos != 0) { seconds -= 1; }
               if (s->chunk.ts_clock_rate)
-                reinterpret_cast<int64_t *>(data_out)[row] =
+                static_cast<int64_t *>(data_out)[row] =
                   seconds * s->chunk.ts_clock_rate +
                   (nanos + (499999999 / s->chunk.ts_clock_rate)) /
                     (1000000000 / s->chunk.ts_clock_rate);  // Output to desired clock rate
               else
-                reinterpret_cast<int64_t *>(data_out)[row] = seconds * 1000000000 + nanos;
+                static_cast<int64_t *>(data_out)[row] = seconds * 1000000000 + nanos;
               break;
             }
           }
@@ -1835,7 +1867,7 @@ cudaError_t __host__ DecodeNullsAndStringDictionaries(ColumnDesc *chunks,
 {
   dim3 dim_block(NTHREADS, 1);
   dim3 dim_grid(num_columns, num_stripes * 2);  // 1024 threads per chunk
-  gpuDecodeNullsAndStringDictionaries<NTHREADS><<<dim_grid, dim_block, 0, stream>>>(
+  gpuDecodeNullsAndStringDictionaries<<<dim_grid, dim_block, 0, stream>>>(
     chunks, global_dictionary, num_columns, num_stripes, max_num_rows, first_row);
   return cudaSuccess;
 }
@@ -1875,16 +1907,16 @@ cudaError_t __host__ DecodeOrcColumnData(ColumnDesc *chunks,
   dim3 dim_block(NTHREADS, 1);  // 1024 threads per chunk
   dim3 dim_grid((num_rowgroups > 0) ? num_columns : num_chunks,
                 (num_rowgroups > 0) ? num_rowgroups : 1);
-  gpuDecodeOrcColumnData<NTHREADS><<<dim_grid, dim_block, 0, stream>>>(chunks,
-                                                                       global_dictionary,
-                                                                       tz_table,
-                                                                       row_groups,
-                                                                       max_num_rows,
-                                                                       first_row,
-                                                                       num_columns,
-                                                                       (uint32_t)(tz_len >> 1),
-                                                                       num_rowgroups,
-                                                                       rowidx_stride);
+  gpuDecodeOrcColumnData<<<dim_grid, dim_block, 0, stream>>>(chunks,
+                                                             global_dictionary,
+                                                             tz_table,
+                                                             row_groups,
+                                                             max_num_rows,
+                                                             first_row,
+                                                             num_columns,
+                                                             (uint32_t)(tz_len >> 1),
+                                                             num_rowgroups,
+                                                             rowidx_stride);
   return cudaSuccess;
 }
 

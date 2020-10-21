@@ -13,9 +13,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <cub/cub.cuh>
 #include <cudf/utilities/error.hpp>
+#include <io/parquet/parquet_gpu.hpp>
 #include <io/utilities/block_utils.cuh>
-#include "parquet_gpu.h"
 
 namespace cudf {
 namespace io {
@@ -77,7 +78,6 @@ inline __device__ uint32_t nvstr_hash16(const uint8_t *p, uint32_t len)
  * @param[in] frag_start_row row position of current fragment
  * @param[in] t thread id
  **/
-template <int block_size>
 __device__ void FetchDictionaryFragment(dict_state_s *s,
                                         uint32_t *dict_data,
                                         uint32_t frag_start_row,
@@ -90,12 +90,12 @@ __device__ void FetchDictionaryFragment(dict_state_s *s,
   __syncthreads();
   // Store the row values in shared mem and set the corresponding dict_data to zero (end-of-list)
   // It's easiest to do this here since we're only dealing with values all within a 5K-row window
-  for (uint32_t i = t; i < s->frag.num_dict_vals; i += block_size) {
+  for (uint32_t i = t; i < s->frag.num_dict_vals; i += 1024) {
     uint32_t r      = dict_data[frag_start_row + i] - frag_start_row;
     s->frag_dict[i] = r;
   }
   __syncthreads();
-  for (uint32_t i = t; i < s->frag.num_dict_vals; i += block_size) {
+  for (uint32_t i = t; i < s->frag.num_dict_vals; i += 1024) {
     uint32_t r                    = s->frag_dict[i];
     dict_data[frag_start_row + r] = 0;
   }
@@ -103,7 +103,6 @@ __device__ void FetchDictionaryFragment(dict_state_s *s,
 }
 
 /// Generate dictionary indices in ascending row order
-template <int block_size>
 __device__ void GenerateDictionaryIndices(dict_state_s *s, uint32_t t)
 {
   uint32_t *dict_index      = s->col.dict_index;
@@ -111,7 +110,7 @@ __device__ void GenerateDictionaryIndices(dict_state_s *s, uint32_t t)
   const uint32_t *valid_map = s->col.valid_map_base;
   uint32_t num_dict_entries = 0;
 
-  for (uint32_t i = 0; i < s->row_cnt; i += block_size) {
+  for (uint32_t i = 0; i < s->row_cnt; i += 1024) {
     uint32_t row      = s->ck.start_row + i + t;
     uint32_t is_valid = (i + t < s->row_cnt && row < s->col.num_rows)
                           ? (valid_map) ? (valid_map[row >> 5] >> (row & 0x1f)) & 1 : 1
@@ -121,7 +120,7 @@ __device__ void GenerateDictionaryIndices(dict_state_s *s, uint32_t t)
       (is_valid &&
        dict_idx ==
          row);  // Any value that doesn't have bit31 set should have dict_idx=row at this point
-    uint32_t umask = ballot(is_unique);
+    uint32_t umask = BALLOT(is_unique);
     uint32_t pos   = num_dict_entries + __popc(umask & ((1 << (t & 0x1f)) - 1));
     if (!(t & 0x1f)) { s->scratch_red[t >> 5] = __popc(umask); }
     num_dict_entries += __syncthreads_count(is_unique);
@@ -187,14 +186,14 @@ __global__ void __launch_bounds__(block_size, 1)
   __syncthreads();
   while (s->row_cnt < s->ck.num_rows) {
     uint32_t frag_start_row = s->ck.start_row + s->row_cnt, num_dict_entries, frag_dict_size;
-    FetchDictionaryFragment<block_size>(s, s->col.dict_data, frag_start_row, t);
+    FetchDictionaryFragment(s, s->col.dict_data, frag_start_row, t);
     __syncthreads();
     num_dict_entries = s->frag.num_dict_vals;
     if (!t) {
       s->num_dict_entries = 0;
       s->frag_dict_size   = 0;
     }
-    for (uint32_t i = 0; i < num_dict_entries; i += block_size) {
+    for (uint32_t i = 0; i < num_dict_entries; i += 1024) {
       bool is_valid    = (i + t < num_dict_entries);
       uint32_t len     = 0;
       uint32_t is_dupe = 0;
@@ -205,18 +204,18 @@ __global__ void __launch_bounds__(block_size, 1)
         row = frag_start_row + s->frag_dict[i + t];
         len = dtype_len;
         if (dtype == BYTE_ARRAY) {
-          const char *ptr = reinterpret_cast<const nvstrdesc_s *>(s->col.column_data_base)[row].ptr;
-          uint32_t count =
-            (uint32_t) reinterpret_cast<const nvstrdesc_s *>(s->col.column_data_base)[row].count;
+          const char *ptr = static_cast<const nvstrdesc_s *>(s->col.column_data_base)[row].ptr;
+          uint32_t count  = static_cast<uint32_t>(
+            static_cast<const nvstrdesc_s *>(s->col.column_data_base)[row].count);
           len += count;
           hash = nvstr_hash16(reinterpret_cast<const uint8_t *>(ptr), count);
           // Walk the list of rows with the same hash
           next_addr = &s->hashmap[hash];
           while ((next = atomicCAS(next_addr, 0, row + 1)) != 0) {
             const char *ptr2 =
-              reinterpret_cast<const nvstrdesc_s *>(s->col.column_data_base)[next - 1].ptr;
+              static_cast<const nvstrdesc_s *>(s->col.column_data_base)[next - 1].ptr;
             uint32_t count2 =
-              reinterpret_cast<const nvstrdesc_s *>(s->col.column_data_base)[next - 1].count;
+              static_cast<const nvstrdesc_s *>(s->col.column_data_base)[next - 1].count;
             if (count2 == count && nvstr_is_equal(ptr, count, ptr2, count2)) {
               is_dupe = 1;
               break;
@@ -227,14 +226,14 @@ __global__ void __launch_bounds__(block_size, 1)
           uint64_t val;
 
           if (dtype_len_in == 8) {
-            val  = reinterpret_cast<const uint64_t *>(s->col.column_data_base)[row];
+            val  = static_cast<const uint64_t *>(s->col.column_data_base)[row];
             hash = uint64_hash16(val);
           } else {
             val = (dtype_len_in == 4)
-                    ? reinterpret_cast<const uint32_t *>(s->col.column_data_base)[row]
+                    ? static_cast<const uint32_t *>(s->col.column_data_base)[row]
                     : (dtype_len_in == 2)
-                        ? reinterpret_cast<const uint16_t *>(s->col.column_data_base)[row]
-                        : reinterpret_cast<const uint8_t *>(s->col.column_data_base)[row];
+                        ? static_cast<const uint16_t *>(s->col.column_data_base)[row]
+                        : static_cast<const uint8_t *>(s->col.column_data_base)[row];
             hash = uint32_hash16(val);
           }
           // Walk the list of rows with the same hash
@@ -242,12 +241,12 @@ __global__ void __launch_bounds__(block_size, 1)
           while ((next = atomicCAS(next_addr, 0, row + 1)) != 0) {
             uint64_t val2 =
               (dtype_len_in == 8)
-                ? reinterpret_cast<const uint64_t *>(s->col.column_data_base)[next - 1]
+                ? static_cast<const uint64_t *>(s->col.column_data_base)[next - 1]
                 : (dtype_len_in == 4)
-                    ? reinterpret_cast<const uint32_t *>(s->col.column_data_base)[next - 1]
+                    ? static_cast<const uint32_t *>(s->col.column_data_base)[next - 1]
                     : (dtype_len_in == 2)
-                        ? reinterpret_cast<const uint16_t *>(s->col.column_data_base)[next - 1]
-                        : reinterpret_cast<const uint8_t *>(s->col.column_data_base)[next - 1];
+                        ? static_cast<const uint16_t *>(s->col.column_data_base)[next - 1]
+                        : static_cast<const uint8_t *>(s->col.column_data_base)[next - 1];
             if (val2 == val) {
               is_dupe = 1;
               break;
@@ -257,12 +256,11 @@ __global__ void __launch_bounds__(block_size, 1)
         }
       }
       // Count the non-duplicate entries
-      frag_dict_size =
-        warp_reduce(temp_storage[threadIdx.x / 32]).Sum((is_valid && !is_dupe) ? len : 0);
+      frag_dict_size = warp_reduce(temp_storage[t / 32]).Sum((is_valid && !is_dupe) ? len : 0);
       if (!(t & 0x1f)) { s->scratch_red[t >> 5] = frag_dict_size; }
       new_dict_entries = __syncthreads_count(is_valid && !is_dupe);
       if (t < 32) {
-        frag_dict_size = warp_reduce(temp_storage[0]).Sum(s->scratch_red[t]);
+        frag_dict_size = warp_reduce(temp_storage[t / 32]).Sum(s->scratch_red[t]);
         if (t == 0) {
           s->frag_dict_size += frag_dict_size;
           s->num_dict_entries += new_dict_entries;
@@ -317,7 +315,7 @@ __global__ void __launch_bounds__(block_size, 1)
     __syncthreads();
   }
   __syncthreads();
-  GenerateDictionaryIndices<block_size>(s, t);
+  GenerateDictionaryIndices(s, t);
   if (!t) {
     chunks[blockIdx.x].num_dict_fragments = s->ck.num_dict_fragments;
     chunks[blockIdx.x].dictionary_size    = s->dictionary_size;
@@ -328,7 +326,7 @@ __global__ void __launch_bounds__(block_size, 1)
 /**
  * @brief Launches kernel for building chunk dictionaries
  *
- * @param[in] chunks Column chunks
+ * @param[in,out] chunks Column chunks
  * @param[in] dev_scratch Device scratch data (kDictScratchSize per dictionary)
  * @param[in] num_chunks Number of column chunks
  * @param[in] stream CUDA stream to use, default 0

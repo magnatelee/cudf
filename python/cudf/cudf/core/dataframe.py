@@ -40,10 +40,12 @@ from cudf.utils.docutils import copy_docstring
 from cudf.utils.dtypes import (
     cudf_dtype_from_pydata_dtype,
     is_categorical_dtype,
+    is_column_like,
     is_list_dtype,
     is_list_like,
     is_scalar,
     is_string_dtype,
+    is_struct_dtype,
     numeric_normalize_types,
 )
 from cudf.utils.utils import OrderedColumnDict
@@ -89,6 +91,17 @@ def _reverse_op(fn):
         "__truediv__": "__rtruediv__",
         "__rtruediv__": "__truediv__",
     }[fn]
+
+
+_cupy_nan_methods_map = {
+    "min": "nanmin",
+    "max": "nanmax",
+    "sum": "nansum",
+    "prod": "nanprod",
+    "mean": "nanmean",
+    "std": "nanstd",
+    "var": "nanvar",
+}
 
 
 class DataFrame(Frame, Serializable):
@@ -1163,7 +1176,7 @@ class DataFrame(Frame, Serializable):
         filling with `<NA>` values.
         """
         for col in df._data:
-            if is_list_dtype(df._data[col]):
+            if is_list_dtype(df._data[col]) or is_struct_dtype(df._data[col]):
                 # TODO we need to handle this
                 pass
             elif df._data[col].has_nulls:
@@ -1202,7 +1215,7 @@ class DataFrame(Frame, Serializable):
             # entire sequence/Index is to be printed.
             # Note : Pandas truncates the dimensions at the end of
             # the resulting dataframe when `display.show_dimensions`
-            # is set to truncate. Hence to display the dimentions we
+            # is set to truncate. Hence to display the dimensions we
             # need to extract maximum of `max_seq_items` and `nrows`
             # and have 1 extra value for ... to show up in the output
             # string.
@@ -2226,54 +2239,6 @@ class DataFrame(Frame, Serializable):
     def __iter__(self):
         return iter(self.columns)
 
-    def equals(self, other):
-        """
-        Test whether two objects contain the same elements.
-        This function allows two Series or DataFrames to be compared against
-        each other to see if they have the same shape and elements. NaNs in
-        the same location are considered equal. The column headers do not
-        need to have the same type.
-
-        Parameters
-        ----------
-        other : Series or DataFrame
-            The other Series or DataFrame to be compared with the first.
-
-        Returns
-        -------
-        bool
-            True if all elements are the same in both objects, False
-            otherwise.
-
-        Examples
-        --------
-        >>> import cudf
-        >>> df = cudf.DataFrame({1: [10], 2: [20]})
-        >>> df
-            1   2
-        0  10  20
-        >>> exactly_equal = cudf.DataFrame({1: [10], 2: [20]})
-        >>> exactly_equal
-            1   2
-        0  10  20
-        >>> df.equals(exactly_equal)
-        True
-        >>> different_column_type = cudf.DataFrame({1.0: [10], 2.0: [20]})
-        >>> different_column_type
-           1.0  2.0
-        0   10   20
-        >>> df.equals(different_column_type)
-        True
-        """
-        for col in self._data.names:
-            if col not in other._data.names:
-                return False
-            if not self[col].equals(other[col]):
-                return False
-        if not self.index.equals(other.index):
-            return False
-        return True
-
     def iteritems(self):
         """ Iterate over column names and series pairs """
         for k in self:
@@ -2627,42 +2592,209 @@ class DataFrame(Frame, Serializable):
 
         return DataFrame(cols, idx)
 
-    def set_index(self, index, drop=True):
+    def _set_index(
+        self, index, to_drop=None, inplace=False, verify_integrity=False,
+    ):
+        """Helper for `.set_index`
+
+        Parameters
+        ----------
+        index : Index
+            The new index to set.
+        to_drop : list optional, default None
+            A list of labels indicating columns to drop.
+        inplace : boolean, default False
+            Modify the DataFrame in place (do not create a new object).
+        verify_integrity : boolean, default False
+            Check for duplicates in the new index.
+        """
+        if not isinstance(index, Index):
+            raise ValueError("Parameter index should be type `Index`.")
+
+        df = self if inplace else self.copy(deep=True)
+
+        if verify_integrity and not index.is_unique:
+            raise ValueError(f"Values in Index are not unique: {index}")
+
+        if to_drop:
+            df.drop(columns=to_drop, inplace=True)
+
+        df.index = index
+        return df if not inplace else None
+
+    def set_index(
+        self,
+        index,
+        drop=True,
+        append=False,
+        inplace=False,
+        verify_integrity=False,
+    ):
         """Return a new DataFrame with a new index
 
         Parameters
         ----------
-        index : Index, Series-convertible, str, or list of str
+        index : Index, Series-convertible, label-like, or list
             Index : the new index.
             Series-convertible : values for the new index.
-            str : name of column to be used as series
-            list of str : name of columns to be converted to a MultiIndex
-        drop : boolean
-            whether to drop corresponding column for str index argument
-        """
-        # When index is a list of column names
-        if isinstance(index, list):
-            if len(index) > 1:
-                df = self.copy(deep=False)
-                if drop:
-                    df = df.drop(columns=index, axis=1)
-                return df.set_index(
-                    cudf.MultiIndex.from_frame(self[index], names=index)
-                )
-            index = index[0]  # List contains single item
+            Label-like : Label of column to be used as index.
+            List : List of items from above.
+        drop : boolean, default True
+            Whether to drop corresponding column for str index argument
+        append : boolean, default True
+            Whether to append columns to the existing index,
+            resulting in a MultiIndex.
+        inplace : boolean, default False
+            Modify the DataFrame in place (do not create a new object).
+        verify_integrity : boolean, default False
+            Check for duplicates in the new index.
 
-        # When index is a column name
-        if isinstance(index, str):
-            df = self.copy(deep=False)
-            if drop:
-                df._drop_column(index)
-            return df.set_index(self[index])
-        # Otherwise
+        Examples
+        --------
+        >>> df = cudf.DataFrame({"a": [1, 2, 3, 4, 5],
+        ... "b": ["a", "b", "c", "d","e"],
+        ... "c": [1.0, 2.0, 3.0, 4.0, 5.0]})
+        >>> df
+           a  b    c
+        0  1  a  1.0
+        1  2  b  2.0
+        2  3  c  3.0
+        3  4  d  4.0
+        4  5  e  5.0
+
+        Set the index to become the ‘b’ column:
+
+        >>> df.set_index('b')
+           a    c
+        b
+        a  1  1.0
+        b  2  2.0
+        c  3  3.0
+        d  4  4.0
+        e  5  5.0
+
+        Create a MultiIndex using columns ‘a’ and ‘b’:
+
+        >>> df.set_index(["a", "b"])
+               c
+        a b
+        1 a  1.0
+        2 b  2.0
+        3 c  3.0
+        4 d  4.0
+        5 e  5.0
+
+        Set new Index instance as index:
+
+        >>> df.set_index(cudf.RangeIndex(10, 15))
+            a  b    c
+        10  1  a  1.0
+        11  2  b  2.0
+        12  3  c  3.0
+        13  4  d  4.0
+        14  5  e  5.0
+
+        Setting `append=True` will combine current index with column `a`:
+
+        >>> df.set_index("a", append=True)
+             b    c
+          a
+        0 1  a  1.0
+        1 2  b  2.0
+        2 3  c  3.0
+        3 4  d  4.0
+        4 5  e  5.0
+
+        `set_index` supports `inplace` parameter too:
+
+        >>> df.set_index("a", inplace=True)
+        >>> df
+           b    c
+        a
+        1  a  1.0
+        2  b  2.0
+        3  c  3.0
+        4  d  4.0
+        5  e  5.0
+        """
+
+        if not isinstance(index, list):
+            index = [index]
+
+        # Preliminary type check
+        col_not_found = []
+        columns_to_add = []
+        names = []
+        to_drop = []
+        for i, col in enumerate(index):
+            # Is column label
+            if is_scalar(col) or isinstance(col, tuple):
+                if col in self.columns:
+                    columns_to_add.append(self[col])
+                    names.append(col)
+                    if drop:
+                        to_drop.append(col)
+                else:
+                    col_not_found.append(col)
+            else:
+                # Try coerce into column
+                if not is_column_like(col):
+                    try:
+                        col = as_column(col)
+                    except TypeError:
+                        msg = f"{col} cannot be converted to column-like."
+                        raise TypeError(msg)
+                if isinstance(col, (cudf.MultiIndex, pd.MultiIndex)):
+                    col = (
+                        cudf.from_pandas(col)
+                        if isinstance(col, pd.MultiIndex)
+                        else col
+                    )
+                    cols = [col._data[x] for x in col._data]
+                    columns_to_add.extend(cols)
+                    names.extend(col.names)
+                else:
+                    if isinstance(col, (pd.RangeIndex, cudf.RangeIndex)):
+                        # Corner case: RangeIndex does not need to instantiate
+                        columns_to_add.append(col)
+                    else:
+                        # For pandas obj, convert to gpu obj
+                        columns_to_add.append(as_column(col))
+                    if isinstance(
+                        col, (cudf.Series, cudf.Index, pd.Series, pd.Index)
+                    ):
+                        names.append(col.name)
+                    else:
+                        names.append(None)
+
+        if col_not_found:
+            raise KeyError(f"None of {col_not_found} are in the columns")
+
+        if append:
+            idx_cols = [self.index._data[x] for x in self.index._data]
+            if isinstance(self.index, cudf.MultiIndex):
+                idx_names = self.index.names
+            else:
+                idx_names = [self.index.name]
+            columns_to_add = idx_cols + columns_to_add
+            names = idx_names + names
+
+        if len(columns_to_add) == 0:
+            raise ValueError("No valid columns to be added to index.")
+        elif len(columns_to_add) == 1:
+            idx = cudf.Index(columns_to_add[0], name=names[0])
         else:
-            index = index if isinstance(index, Index) else as_index(index)
-            df = self.copy(deep=False)
-            df.index = index
-            return df
+            idf = cudf.DataFrame()
+            for i, col in enumerate(columns_to_add):
+                idf[i] = col
+            idx = cudf.MultiIndex.from_frame(idf, names=names)
+
+        return self._set_index(
+            index=idx,
+            to_drop=to_drop,
+            inplace=inplace,
+            verify_integrity=verify_integrity,
+        )
 
     def reset_index(
         self, level=None, drop=False, inplace=False, col_level=0, col_fill=""
@@ -3979,7 +4111,7 @@ class DataFrame(Frame, Serializable):
             win_type=win_type,
         )
 
-    def query(self, expr, local_dict={}):
+    def query(self, expr, local_dict=None):
         """
         Query with a boolean expression using Numba to compile a GPU kernel.
 
@@ -4046,6 +4178,9 @@ class DataFrame(Frame, Serializable):
         # can't use `annotate` decorator here as we inspect the calling
         # environment.
         with annotate("QUERY", color="purple", domain="cudf_python"):
+            if local_dict is None:
+                local_dict = {}
+
             if self.empty:
                 return self.copy()
 
@@ -4151,7 +4286,7 @@ class DataFrame(Frame, Serializable):
         func,
         incols,
         outcols,
-        kwargs={},
+        kwargs=None,
         pessimistic_nulls=True,
         chunks=None,
         blkct=None,
@@ -4197,6 +4332,8 @@ class DataFrame(Frame, Serializable):
         --------
         DataFrame.apply_rows
         """
+        if kwargs is None:
+            kwargs = {}
         if chunks is None:
             raise ValueError("*chunks* must be defined")
         return applyutils.apply_chunks(
@@ -5379,15 +5516,18 @@ class DataFrame(Frame, Serializable):
     #
     # Stats
     #
-    def _prepare_for_rowwise_op(self):
+    def _prepare_for_rowwise_op(self, method, skipna):
         """Prepare a DataFrame for CuPy-based row-wise operations.
         """
 
-        if any([col.nullable for col in self._columns]):
+        if method not in _cupy_nan_methods_map and any(
+            col.nullable for col in self._columns
+        ):
             msg = (
-                "Row-wise operations do not currently support columns with "
-                "null values. Consider removing them with .dropna() "
-                "or using .fillna()."
+                f"Row-wise operations to calculate '{method}' is not "
+                f"currently support columns with null values. "
+                f"Consider removing them with .dropna() "
+                f"or using .fillna()."
             )
             raise ValueError(msg)
 
@@ -5399,8 +5539,22 @@ class DataFrame(Frame, Serializable):
                 "and bool dtypes. Non numeric columns are ignored."
             )
             warnings.warn(msg)
+
+        if not skipna and any(col.nullable for col in filtered._columns):
+            mask = cudf.DataFrame(
+                {
+                    name: filtered._data[name]._get_mask_as_column()
+                    if filtered._data[name].nullable
+                    else column.full(len(filtered._data[name]), True)
+                    for name in filtered._data.names
+                }
+            )
+            mask = mask.all(axis=1)
+        else:
+            mask = None
+
         coerced = filtered.astype(common_dtype)
-        return coerced
+        return coerced, mask, common_dtype
 
     def count(self, axis=0, level=None, numeric_only=False, **kwargs):
         """
@@ -5464,7 +5618,7 @@ class DataFrame(Frame, Serializable):
 
         Notes
         -----
-        Parameters currently not supported are `axis`, `level`, `numeric_only`.
+        Parameters currently not supported are `level`, `numeric_only`.
 
         Examples
         --------
@@ -5509,7 +5663,7 @@ class DataFrame(Frame, Serializable):
 
         Notes
         -----
-        Parameters currently not supported are `axis`, `level`, `numeric_only`.
+        Parameters currently not supported are `level`, `numeric_only`.
 
         Examples
         --------
@@ -5545,12 +5699,12 @@ class DataFrame(Frame, Serializable):
         Parameters
         ----------
 
+        axis: {index (0), columns(1)}
+            Axis for the function to be applied on.
         skipna: bool, default True
             Exclude NA/null values when computing the result.
-
         dtype: data type
             Data type to cast the result to.
-
         min_count: int, default 0
             The required number of valid values to perform the operation.
             If fewer than min_count non-NA values are present the result
@@ -5565,7 +5719,7 @@ class DataFrame(Frame, Serializable):
 
         Notes
         -----
-        Parameters currently not supported are `axis`, `level`, `numeric_only`.
+        Parameters currently not supported are `level`, `numeric_only`.
 
         Examples
         --------
@@ -5603,12 +5757,12 @@ class DataFrame(Frame, Serializable):
         Parameters
         ----------
 
+        axis: {index (0), columns(1)}
+            Axis for the function to be applied on.
         skipna: bool, default True
             Exclude NA/null values when computing the result.
-
         dtype: data type
             Data type to cast the result to.
-
         min_count: int, default 0
             The required number of valid values to perform the operation.
             If fewer than min_count non-NA values are present the result
@@ -5623,7 +5777,7 @@ class DataFrame(Frame, Serializable):
 
         Notes
         -----
-        Parameters currently not supported are `axis`, `level`, `numeric_only`.
+        Parameters currently not supported are level`, `numeric_only`.
 
         Examples
         --------
@@ -5661,12 +5815,12 @@ class DataFrame(Frame, Serializable):
         Parameters
         ----------
 
+        axis: {index (0), columns(1)}
+            Axis for the function to be applied on.
         skipna: bool, default True
             Exclude NA/null values when computing the result.
-
         dtype: data type
             Data type to cast the result to.
-
         min_count: int, default 0
             The required number of valid values to perform the operation.
             If fewer than min_count non-NA values are present the result
@@ -5681,7 +5835,7 @@ class DataFrame(Frame, Serializable):
 
         Notes
         -----
-        Parameters currently not supported are `axis`, `level`, `numeric_only`.
+        Parameters currently not supported are `level`, `numeric_only`.
 
         Examples
         --------
@@ -6001,10 +6155,11 @@ class DataFrame(Frame, Serializable):
         Parameters
         ----------
 
+        axis: {index (0), columns(1)}
+            Axis for the function to be applied on.
         skipna: bool, default True
             Exclude NA/null values. If an entire row/column is NA, the result
             will be NA.
-
         ddof: int, default 1
             Delta Degrees of Freedom. The divisor used in calculations
             is N - ddof, where N represents the number of elements.
@@ -6015,7 +6170,7 @@ class DataFrame(Frame, Serializable):
 
         Notes
         -----
-        Parameters currently not supported are `axis`, `level` and
+        Parameters currently not supported are `level` and
         `numeric_only`
 
         Examples
@@ -6056,10 +6211,11 @@ class DataFrame(Frame, Serializable):
         Parameters
         ----------
 
+        axis: {index (0), columns(1)}
+            Axis for the function to be applied on.
         skipna: bool, default True
             Exclude NA/null values. If an entire row/column is NA, the result
             will be NA.
-
         ddof: int, default 1
             Delta Degrees of Freedom. The divisor used in calculations is
             N - ddof, where N represents the number of elements.
@@ -6070,7 +6226,7 @@ class DataFrame(Frame, Serializable):
 
         Notes
         -----
-        Parameters currently not supported are `axis`, `level` and
+        Parameters currently not supported are `level` and
         `numeric_only`
 
         Examples
@@ -6305,10 +6461,15 @@ class DataFrame(Frame, Serializable):
         elif axis == 1:
             # for dask metadata compatibility
             skipna = kwargs.pop("skipna", None)
-            if skipna not in (None, True, 1):
-                msg = "Row-wise operations currently do not "
-                "support `skipna=False`."
-                raise NotImplementedError(msg)
+            if method not in _cupy_nan_methods_map and skipna not in (
+                None,
+                True,
+                1,
+            ):
+                raise NotImplementedError(
+                    f"Row-wise operation to calculate '{method}'"
+                    f" currently do not support `skipna=False`."
+                )
 
             level = kwargs.pop("level", None)
             if level not in (None,):
@@ -6334,13 +6495,51 @@ class DataFrame(Frame, Serializable):
                 "support `bool_only`."
                 raise NotImplementedError(msg)
 
-            prepared = self._prepare_for_rowwise_op()
+            prepared, mask, common_dtype = self._prepare_for_rowwise_op(
+                method, skipna
+            )
+            for col in prepared._data.names:
+                if prepared._data[col].nullable:
+                    prepared._data[col] = (
+                        prepared._data[col]
+                        .astype(
+                            cudf.utils.dtypes.get_min_float_dtype(
+                                prepared._data[col]
+                            )
+                        )
+                        .fillna(np.nan)
+                    )
             arr = cupy.asarray(prepared.as_gpu_matrix())
 
-            result = getattr(arr, method)(axis=1, **kwargs)
+            if skipna is not False and method in _cupy_nan_methods_map:
+                method = _cupy_nan_methods_map[method]
 
-            if len(result.shape) == 1:
-                return Series(result, index=self.index)
+            result = getattr(cupy, method)(arr, axis=1, **kwargs)
+
+            if result.ndim == 1:
+                result = column.as_column(result)
+                if mask is not None:
+                    result = result.set_mask(
+                        cudf._lib.transform.bools_to_mask(mask._column)
+                    )
+                return Series(
+                    result,
+                    index=self.index,
+                    dtype=common_dtype
+                    if method
+                    in {
+                        "count",
+                        "min",
+                        "max",
+                        "sum",
+                        "prod",
+                        "cummin",
+                        "cummax",
+                        "cumsum",
+                        "cumprod",
+                    }
+                    else None,
+                )
             else:
                 result_df = DataFrame.from_gpu_matrix(result).set_index(
                     self.index
@@ -6526,10 +6725,10 @@ class DataFrame(Frame, Serializable):
 
         return dlpack.to_dlpack(self)
 
-    @ioutils.doc_to_csv()
+    @ioutils.doc_dataframe_to_csv()
     def to_csv(
         self,
-        path=None,
+        path_or_buf=None,
         sep=",",
         na_rep="",
         columns=None,
@@ -6543,14 +6742,14 @@ class DataFrame(Frame, Serializable):
 
         return csv.to_csv(
             self,
-            path,
-            sep,
-            na_rep,
-            columns,
-            header,
-            index,
-            line_terminator,
-            chunksize,
+            path_or_buf=path_or_buf,
+            sep=sep,
+            na_rep=na_rep,
+            columns=columns,
+            header=header,
+            index=index,
+            line_terminator=line_terminator,
+            chunksize=chunksize,
         )
 
     @ioutils.doc_to_orc()
@@ -6864,6 +7063,16 @@ class DataFrame(Frame, Serializable):
             self, level=level, fill_value=fill_value
         )
 
+    def equals(self, other):
+        if not isinstance(other, DataFrame):
+            return False
+        for self_name, other_name in zip(self._data.names, other._data.names):
+            if self_name != other_name:
+                return False
+        return super().equals(other)
+
+    _accessors = set()
+
 
 def from_pandas(obj, nan_as_null=None):
     """
@@ -7106,7 +7315,7 @@ def _get_union_of_indices(indexes):
 def _get_union_of_series_names(series_list):
     names_list = []
     unnamed_count = 0
-    for idx, series in enumerate(series_list):
+    for series in series_list:
         if series.name is None:
             names_list.append(f"Unnamed {unnamed_count}")
             unnamed_count += 1
