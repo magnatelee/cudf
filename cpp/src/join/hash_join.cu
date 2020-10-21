@@ -215,11 +215,12 @@ std::unique_ptr<multimap_type, std::function<void(multimap_type *)>> build_join_
                                           stream);
 
   row_hash hash_build{build_table};
-  rmm::device_scalar<int> failure(0, 0);
+  rmm::device_scalar<int> failure(0, stream);
   constexpr int block_size{DEFAULT_JOIN_BLOCK_SIZE};
   detail::grid_1d config(build_table_num_rows, block_size);
-  build_hash_table<<<config.num_blocks, config.num_threads_per_block, 0, 0>>>(
+  build_hash_table<<<config.num_blocks, config.num_threads_per_block, 0, stream>>>(
     *hash_table, hash_build, build_table_num_rows, failure.data());
+  CHECK_CUDA(stream);
   // Check error code from the kernel
   if (failure.value() == 1) { CUDF_FAIL("Hash Table insert failure."); }
 
@@ -272,7 +273,7 @@ std::pair<rmm::device_vector<size_type>, rmm::device_vector<size_type>> probe_jo
 
     constexpr int block_size{DEFAULT_JOIN_BLOCK_SIZE};
     detail::grid_1d config(probe_table.num_rows(), block_size);
-    write_index.set_value(0);
+    write_index.set_value(0, stream);
 
     row_hash hash_probe{probe_table};
     row_equality equality{probe_table, build_table, compare_nulls == null_equality::EQUAL};
@@ -289,7 +290,7 @@ std::pair<rmm::device_vector<size_type>, rmm::device_vector<size_type>> probe_jo
 
     CHECK_CUDA(stream);
 
-    join_size              = write_index.value();
+    join_size              = write_index.value(stream);
     current_estimated_size = estimated_size;
     estimated_size *= 2;
   } while ((current_estimated_size < join_size));
@@ -479,7 +480,8 @@ std::unique_ptr<cudf::table> combine_table_pair(std::unique_ptr<cudf::table> &&l
 hash_join::hash_join_impl::~hash_join_impl() = default;
 
 hash_join::hash_join_impl::hash_join_impl(cudf::table_view const &build,
-                                          std::vector<size_type> const &build_on)
+                                          std::vector<size_type> const &build_on,
+                                          cudaStream_t stream)
   : _build(build),
     _build_selected(build.select(build_on)),
     _build_on(build_on),
@@ -492,8 +494,8 @@ hash_join::hash_join_impl::hash_join_impl(cudf::table_view const &build,
 
   if (_build_on.empty() || 0 == build.num_rows()) { return; }
 
-  auto build_table = cudf::table_device_view::create(_build_selected);
-  _hash_table      = build_join_hash_table(*build_table, 0);
+  auto build_table = cudf::table_device_view::create(_build_selected, stream);
+  _hash_table      = build_join_hash_table(*build_table, stream);
 }
 
 std::pair<std::unique_ptr<cudf::table>, std::unique_ptr<cudf::table>>

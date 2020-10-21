@@ -99,8 +99,8 @@ std::unique_ptr<table> full_join(
 
 hash_join::~hash_join() = default;
 
-hash_join::hash_join(cudf::table_view const& build, std::vector<size_type> const& build_on)
-  : impl{std::make_unique<const hash_join::hash_join_impl>(build, build_on)}
+hash_join::hash_join(cudf::table_view const& build, std::vector<size_type> const& build_on, cudaStream_t stream)
+  : impl{std::make_unique<const hash_join::hash_join_impl>(build, build_on, stream)}
 {
 }
 

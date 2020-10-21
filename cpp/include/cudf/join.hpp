@@ -399,7 +399,7 @@ class hash_join {
    * @param build The build table, from which the hash table is built.
    * @param build_on The column indices from `build` to join on.
    */
-  hash_join(cudf::table_view const& build, std::vector<size_type> const& build_on);
+  hash_join(cudf::table_view const& build, std::vector<size_type> const& build_on, cudaStream_t stream = 0);
 
   /**
    * @brief Controls where common columns will be output for a inner join.
