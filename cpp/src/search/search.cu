@@ -93,8 +93,12 @@ std::unique_ptr<column> search_ordered(table_view const& t,
                  "Mismatch between number of columns and null precedence.");
   }
 
-  auto d_t      = table_device_view::create(t, stream);
-  auto d_values = table_device_view::create(values, stream);
+  // This utility will ensure all corresponding dictionary columns have matching keys.
+  // It will return any new dictionary columns created as well as updated table_views.
+  auto matched = dictionary::detail::match_dictionaries(
+    {t, values}, rmm::mr::get_current_device_resource(), stream);
+  auto d_t      = table_device_view::create(matched.second.front(), stream);
+  auto d_values = table_device_view::create(matched.second.back(), stream);
   auto count_it = thrust::make_counting_iterator<size_type>(0);
 
   rmm::device_vector<order> d_column_order(column_order.begin(), column_order.end());
@@ -205,7 +209,7 @@ bool contains_scalar_dispatch::operator()<cudf::dictionary32>(column_view const&
 namespace detail {
 bool contains(column_view const& col, scalar const& value, cudaStream_t stream)
 {
-  if (col.size() == 0) { return false; }
+  if (col.is_empty()) { return false; }
 
   if (not value.is_valid()) { return col.has_nulls(); }
 
@@ -226,11 +230,11 @@ struct multi_contains_dispatch {
                                                          stream,
                                                          mr);
 
-    if (haystack.size() == 0) { return result; }
+    if (haystack.is_empty()) { return result; }
 
     mutable_column_view result_view = result.get()->mutable_view();
 
-    if (needles.size() == 0) {
+    if (needles.is_empty()) {
       thrust::fill(rmm::exec_policy(stream)->on(stream),
                    result_view.begin<bool>(),
                    result_view.end<bool>(),

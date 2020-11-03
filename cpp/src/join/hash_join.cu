@@ -13,12 +13,13 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <cudf/copying.hpp>
 #include <cudf/detail/concatenate.cuh>
 #include <cudf/detail/gather.cuh>
 #include <cudf/detail/gather.hpp>
 
-#include "hash_join.cuh"
+#include <join/hash_join.cuh>
+
+#include <numeric>
 
 namespace cudf {
 namespace detail {
@@ -91,9 +92,9 @@ VectorPair concatenate_vector_pairs(VectorPair &a, VectorPair &b)
                "Mismatch between sizes of vectors in vector pair");
   CUDF_EXPECTS((b.first.size() == b.second.size()),
                "Mismatch between sizes of vectors in vector pair");
-  if (a.first.size() == 0) {
+  if (a.first.empty()) {
     return b;
-  } else if (b.first.size() == 0) {
+  } else if (b.first.empty()) {
     return a;
   }
   auto original_size = a.first.size();
@@ -222,7 +223,7 @@ std::unique_ptr<multimap_type, std::function<void(multimap_type *)>> build_join_
     *hash_table, hash_build, build_table_num_rows, failure.data());
   CHECK_CUDA(stream);
   // Check error code from the kernel
-  if (failure.value() == 1) { CUDF_FAIL("Hash Table insert failure."); }
+  if (failure.value(stream) == 1) { CUDF_FAIL("Hash Table insert failure."); }
 
   return hash_table;
 }
