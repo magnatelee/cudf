@@ -155,7 +155,7 @@ option(BUILD_BENCHMARKS "Configure CMake to build (google) benchmarks" OFF)
 
 option(USE_REALM_HIJACK "Use Realm's CUDA hijack" OFF)
 if(USE_REALM_HIJACK)
-  find_library(REALM_LIBRARY "realm" HINTS "$ENV{REALM_ROOT}/lib")
+  find_library(REALM_LIBRARY "realm" HINTS "${REALM_ROOT}/lib")
   message(STATUS "REALM: REALM_LIBRARY set to ${REALM_LIBRARY}")
 endif(USE_REALM_HIJACK)
 
