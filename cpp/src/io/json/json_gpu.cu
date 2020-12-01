@@ -30,6 +30,7 @@
 #include <cudf/utilities/traits.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
+#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 
 #include <thrust/detail/copy.h>
@@ -593,12 +594,13 @@ __global__ void convert_data_to_columns_kernel(parse_options_view opts,
  * @param[in] num_columns The number of columns of input data
  * @param[out] column_infos The count for each column data type
  */
-__global__ void detect_data_types_kernel(parse_options_view const opts,
-                                         device_span<char const> const data,
-                                         device_span<uint64_t const> const row_offsets,
-                                         col_map_type *col_map,
-                                         int num_columns,
-                                         device_span<column_info> const column_infos)
+__global__ void detect_data_types_kernel(
+  parse_options_view const opts,
+  device_span<char const> const data,
+  device_span<uint64_t const> const row_offsets,
+  col_map_type *col_map,
+  int num_columns,
+  device_span<cudf::io::column_type_histogram> const column_infos)
 {
   auto const rec_id = threadIdx.x + (blockDim.x * blockIdx.x);
   if (rec_id >= row_offsets.size()) return;
@@ -637,6 +639,7 @@ __global__ void detect_data_types_kernel(parse_options_view const opts,
     int decimal_count  = 0;
     int slash_count    = 0;
     int dash_count     = 0;
+    int plus_count     = 0;
     int colon_count    = 0;
     int exponent_count = 0;
     int other_count    = 0;
@@ -654,6 +657,7 @@ __global__ void detect_data_types_kernel(parse_options_view const opts,
       switch (*pos) {
         case '.': decimal_count++; break;
         case '-': dash_count++; break;
+        case '+': plus_count++; break;
         case '/': slash_count++; break;
         case ':': colon_count++; break;
         case 'e':
@@ -667,15 +671,22 @@ __global__ void detect_data_types_kernel(parse_options_view const opts,
     // Integers have to have the length of the string
     int int_req_number_cnt = value_len;
     // Off by one if they start with a minus sign
-    if (*desc.value_begin == '-' && value_len > 1) { --int_req_number_cnt; }
+    if ((*desc.value_begin == '-' || *desc.value_begin == '+') && value_len > 1) {
+      --int_req_number_cnt;
+    }
     // Off by one if they are a hexadecimal number
     if (maybe_hex) { --int_req_number_cnt; }
     if (serialized_trie_contains(opts.trie_true, desc.value_begin, value_len) ||
         serialized_trie_contains(opts.trie_false, desc.value_begin, value_len)) {
       atomicAdd(&column_infos[desc.column].bool_count, 1);
     } else if (digit_count == int_req_number_cnt) {
-      atomicAdd(&column_infos[desc.column].int_count, 1);
-    } else if (is_like_float(value_len, digit_count, decimal_count, dash_count, exponent_count)) {
+      bool is_negative       = (*desc.value_begin == '-');
+      char const *data_begin = desc.value_begin + (is_negative || (*desc.value_begin == '+'));
+      cudf::size_type *ptr   = cudf::io::gpu::infer_integral_field_counter(
+        data_begin, data_begin + digit_count, is_negative, column_infos[desc.column]);
+      atomicAdd(ptr, 1);
+    } else if (is_like_float(
+                 value_len, digit_count, decimal_count, dash_count + plus_count, exponent_count)) {
       atomicAdd(&column_infos[desc.column].float_count, 1);
     }
     // A date-time field cannot have more than 3 non-special characters
@@ -785,7 +796,7 @@ void convert_json_to_columns(parse_options_view const &opts,
                              device_span<void *const> const output_columns,
                              device_span<bitmask_type *const> const valid_fields,
                              device_span<cudf::size_type> num_valid_fields,
-                             cudaStream_t stream)
+                             rmm::cuda_stream_view stream)
 {
   int block_size;
   int min_grid_size;
@@ -794,37 +805,37 @@ void convert_json_to_columns(parse_options_view const &opts,
 
   const int grid_size = (row_offsets.size() + block_size - 1) / block_size;
 
-  convert_data_to_columns_kernel<<<grid_size, block_size, 0, stream>>>(
+  convert_data_to_columns_kernel<<<grid_size, block_size, 0, stream.value()>>>(
     opts, data, row_offsets, column_types, col_map, output_columns, valid_fields, num_valid_fields);
 
   CUDA_TRY(cudaGetLastError());
 }
 
 /**
- * @copydoc cudf::io::json::gpu::detect_data_types
+ * @copydoc cudf::io::gpu::detect_data_types
  */
 
-std::vector<cudf::io::json::column_info> detect_data_types(
+std::vector<cudf::io::column_type_histogram> detect_data_types(
   const parse_options_view &options,
   device_span<char const> const data,
   device_span<uint64_t const> const row_offsets,
   bool do_set_null_count,
   int num_columns,
   col_map_type *col_map,
-  cudaStream_t stream)
+  rmm::cuda_stream_view stream)
 {
   int block_size;
   int min_grid_size;
   CUDA_TRY(
     cudaOccupancyMaxPotentialBlockSize(&min_grid_size, &block_size, detect_data_types_kernel));
 
-  rmm::device_vector<cudf::io::json::column_info> d_column_infos(num_columns,
-                                                                 cudf::io::json::column_info{});
+  rmm::device_vector<cudf::io::column_type_histogram> d_column_infos(
+    num_columns, cudf::io::column_type_histogram{});
 
   if (do_set_null_count) {
     // Set the null count to the row count (all fields assumes to be null).
     thrust::for_each(
-      rmm::exec_policy(stream)->on(stream),
+      rmm::exec_policy(stream)->on(stream.value()),
       d_column_infos.begin(),
       d_column_infos.end(),
       [num_records = row_offsets.size()] __device__(auto &info) { info.null_count = num_records; });
@@ -833,12 +844,12 @@ std::vector<cudf::io::json::column_info> detect_data_types(
   // Calculate actual block count to use based on records count
   const int grid_size = (row_offsets.size() + block_size - 1) / block_size;
 
-  detect_data_types_kernel<<<grid_size, block_size, 0, stream>>>(
+  detect_data_types_kernel<<<grid_size, block_size, 0, stream.value()>>>(
     options, data, row_offsets, col_map, num_columns, d_column_infos);
 
   CUDA_TRY(cudaGetLastError());
 
-  auto h_column_infos = std::vector<cudf::io::json::column_info>(num_columns);
+  auto h_column_infos = std::vector<cudf::io::column_type_histogram>(num_columns);
 
   thrust::copy(d_column_infos.begin(), d_column_infos.end(), h_column_infos.begin());
 
@@ -853,7 +864,7 @@ void collect_keys_info(parse_options_view const &options,
                        device_span<uint64_t const> const row_offsets,
                        unsigned long long int *keys_cnt,
                        thrust::optional<mutable_table_device_view> keys_info,
-                       cudaStream_t stream)
+                       rmm::cuda_stream_view stream)
 {
   int block_size;
   int min_grid_size;
@@ -863,7 +874,7 @@ void collect_keys_info(parse_options_view const &options,
   // Calculate actual block count to use based on records count
   const int grid_size = (row_offsets.size() + block_size - 1) / block_size;
 
-  collect_keys_info_kernel<<<grid_size, block_size, 0, stream>>>(
+  collect_keys_info_kernel<<<grid_size, block_size, 0, stream.value()>>>(
     options, data, row_offsets, keys_cnt, keys_info);
 
   CUDA_TRY(cudaGetLastError());

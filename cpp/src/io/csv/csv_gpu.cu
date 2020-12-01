@@ -32,6 +32,8 @@
 #include <cudf/utilities/traits.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
+#include <rmm/cuda_stream_view.hpp>
+
 #include <thrust/detail/copy.h>
 #include <thrust/transform.h>
 
@@ -190,7 +192,7 @@ __global__ void __launch_bounds__(csvparse_block_dim)
                       device_span<char const> csv_text,
                       device_span<column_parse::flags const> const column_flags,
                       device_span<uint64_t const> const row_offsets,
-                      device_span<column_parse::stats> d_columnData)
+                      device_span<column_type_histogram> d_columnData)
 {
   auto raw_csv = csv_text.data();
 
@@ -223,12 +225,12 @@ __global__ void __launch_bounds__(csvparse_block_dim)
       long field_len = pos - start;
 
       if (field_len <= 0 || serialized_trie_contains(opts.trie_na, raw_csv + start, field_len)) {
-        atomicAdd(&d_columnData[actual_col].countNULL, 1);
+        atomicAdd(&d_columnData[actual_col].null_count, 1);
       } else if (serialized_trie_contains(opts.trie_true, raw_csv + start, field_len) ||
                  serialized_trie_contains(opts.trie_false, raw_csv + start, field_len)) {
-        atomicAdd(&d_columnData[actual_col].countBool, 1);
+        atomicAdd(&d_columnData[actual_col].bool_count, 1);
       } else if (cudf::io::gpu::is_infinity(raw_csv + start, raw_csv + tempPos)) {
-        atomicAdd(&d_columnData[actual_col].countFloat, 1);
+        atomicAdd(&d_columnData[actual_col].float_count, 1);
       } else {
         long countNumber   = 0;
         long countDecimal  = 0;
@@ -273,21 +275,25 @@ __global__ void __launch_bounds__(csvparse_block_dim)
 
         if (field_len == 0) {
           // Ignoring whitespace and quotes can result in empty fields
-          atomicAdd(&d_columnData[actual_col].countNULL, 1);
+          atomicAdd(&d_columnData[actual_col].null_count, 1);
         } else if (column_flags[col] & column_parse::as_datetime) {
           // PANDAS uses `object` dtype if the date is unparseable
           if (is_datetime(countString, countDecimal, countColon, countDash, countSlash)) {
-            atomicAdd(&d_columnData[actual_col].countDateAndTime, 1);
+            atomicAdd(&d_columnData[actual_col].datetime_count, 1);
           } else {
-            atomicAdd(&d_columnData[actual_col].countString, 1);
+            atomicAdd(&d_columnData[actual_col].string_count, 1);
           }
         } else if (countNumber == int_req_number_cnt) {
-          atomicAdd(&d_columnData[actual_col].countInt64, 1);
+          bool is_negative       = (raw_csv[start] == '-');
+          char const *data_begin = raw_csv + start + (is_negative || (raw_csv[start] == '+'));
+          cudf::size_type *ptr   = cudf::io::gpu::infer_integral_field_counter(
+            data_begin, data_begin + countNumber, is_negative, d_columnData[actual_col]);
+          atomicAdd(ptr, 1);
         } else if (is_floatingpoint(
                      field_len, countNumber, countDecimal, countDash + countPlus, countExponent)) {
-          atomicAdd(&d_columnData[actual_col].countFloat, 1);
+          atomicAdd(&d_columnData[actual_col].float_count, 1);
         } else {
-          atomicAdd(&d_columnData[actual_col].countString, 1);
+          atomicAdd(&d_columnData[actual_col].string_count, 1);
         }
       }
       actual_col++;
@@ -1005,13 +1011,13 @@ __global__ void __launch_bounds__(rowofs_block_dim)
 size_t __host__ count_blank_rows(const cudf::io::parse_options_view &opts,
                                  device_span<char const> const data,
                                  device_span<uint64_t const> const row_offsets,
-                                 cudaStream_t stream)
+                                 rmm::cuda_stream_view stream)
 {
   const auto newline  = opts.skipblanklines ? opts.terminator : opts.comment;
   const auto comment  = opts.comment != '\0' ? opts.comment : newline;
   const auto carriage = (opts.skipblanklines && opts.terminator == '\n') ? '\r' : comment;
   return thrust::count_if(
-    rmm::exec_policy(stream)->on(stream),
+    rmm::exec_policy(stream)->on(stream.value()),
     row_offsets.begin(),
     row_offsets.end(),
     [data = data, newline, comment, carriage] __device__(const uint64_t pos) {
@@ -1023,14 +1029,14 @@ size_t __host__ count_blank_rows(const cudf::io::parse_options_view &opts,
 void __host__ remove_blank_rows(cudf::io::parse_options_view const &options,
                                 device_span<char const> const data,
                                 rmm::device_vector<uint64_t> &row_offsets,
-                                cudaStream_t stream)
+                                rmm::cuda_stream_view stream)
 {
   size_t d_size       = data.size();
   const auto newline  = options.skipblanklines ? options.terminator : options.comment;
   const auto comment  = options.comment != '\0' ? options.comment : newline;
   const auto carriage = (options.skipblanklines && options.terminator == '\n') ? '\r' : comment;
   auto new_end        = thrust::remove_if(
-    rmm::exec_policy(stream)->on(stream),
+    rmm::exec_policy(stream)->on(stream.value()),
     row_offsets.begin(),
     row_offsets.end(),
     [data = data, d_size, newline, comment, carriage] __device__(const uint64_t pos) {
@@ -1040,24 +1046,24 @@ void __host__ remove_blank_rows(cudf::io::parse_options_view const &options,
   row_offsets.resize(new_end - row_offsets.begin());
 }
 
-thrust::host_vector<column_parse::stats> detect_column_types(
+thrust::host_vector<column_type_histogram> detect_column_types(
   cudf::io::parse_options_view const &options,
   device_span<char const> const data,
   device_span<column_parse::flags const> const column_flags,
   device_span<uint64_t const> const row_starts,
   size_t const num_active_columns,
-  cudaStream_t stream)
+  rmm::cuda_stream_view stream)
 {
   // Calculate actual block count to use based on records count
   const int block_size = csvparse_block_dim;
   const int grid_size  = (row_starts.size() + block_size - 1) / block_size;
 
-  auto d_stats = rmm::device_vector<column_parse::stats>(num_active_columns);
+  auto d_stats = rmm::device_vector<column_type_histogram>(num_active_columns);
 
-  data_type_detection<<<grid_size, block_size, 0, stream>>>(
+  data_type_detection<<<grid_size, block_size, 0, stream.value()>>>(
     options, data, column_flags, row_starts, d_stats);
 
-  return thrust::host_vector<column_parse::stats>(d_stats);
+  return thrust::host_vector<column_type_histogram>(d_stats);
 }
 
 void __host__ decode_row_column_data(cudf::io::parse_options_view const &options,
@@ -1067,14 +1073,14 @@ void __host__ decode_row_column_data(cudf::io::parse_options_view const &options
                                      device_span<cudf::data_type const> const dtypes,
                                      device_span<void *> const columns,
                                      device_span<cudf::bitmask_type *> const valids,
-                                     cudaStream_t stream)
+                                     rmm::cuda_stream_view stream)
 {
   // Calculate actual block count to use based on records count
   auto const block_size = csvparse_block_dim;
   auto const num_rows   = row_offsets.size() - 1;
   auto const grid_size  = (num_rows + block_size - 1) / block_size;
 
-  convert_csv_to_cudf<<<grid_size, block_size, 0, stream>>>(
+  convert_csv_to_cudf<<<grid_size, block_size, 0, stream.value()>>>(
     options, data, column_flags, row_offsets, dtypes, columns, valids);
 }
 
@@ -1089,11 +1095,11 @@ uint32_t __host__ gather_row_offsets(const parse_options_view &options,
                                      size_t byte_range_start,
                                      size_t byte_range_end,
                                      size_t skip_rows,
-                                     cudaStream_t stream)
+                                     rmm::cuda_stream_view stream)
 {
   uint32_t dim_grid = 1 + (chunk_size / rowofs_block_bytes);
 
-  gather_row_offsets_gpu<<<dim_grid, rowofs_block_dim, 0, stream>>>(
+  gather_row_offsets_gpu<<<dim_grid, rowofs_block_dim, 0, stream.value()>>>(
     row_ctx,
     offsets_out,
     data,
