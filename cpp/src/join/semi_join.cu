@@ -169,8 +169,7 @@ std::unique_ptr<cudf::table> left_semi_join(cudf::table_view const& left,
                                             std::vector<cudf::size_type> const& right_on,
                                             std::vector<cudf::size_type> const& return_columns,
                                             null_equality compare_nulls,
-                                            rmm::mr::device_memory_resource* mr,
-                                            cudaStream_t stream)
+                                            rmm::mr::device_memory_resource* mr)
 {
   CUDF_FUNC_RANGE();
   return detail::left_semi_anti_join<detail::join_kind::LEFT_SEMI_JOIN>(
@@ -183,8 +182,7 @@ std::unique_ptr<cudf::table> left_anti_join(cudf::table_view const& left,
                                             std::vector<cudf::size_type> const& right_on,
                                             std::vector<cudf::size_type> const& return_columns,
                                             null_equality compare_nulls,
-                                            rmm::mr::device_memory_resource* mr,
-                                            cudaStream_t stream)
+                                            rmm::mr::device_memory_resource* mr)
 {
   CUDF_FUNC_RANGE();
   return detail::left_semi_anti_join<detail::join_kind::LEFT_ANTI_JOIN>(
