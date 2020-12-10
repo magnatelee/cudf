@@ -20,6 +20,8 @@
 #include <cudf/detail/gather.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
+#include <rmm/device_vector.hpp>
+#include <rmm/exec_policy.hpp>
 
 #include <numeric>
 
@@ -148,7 +150,7 @@ get_left_join_indices_complement(rmm::device_vector<size_type> &right_indices,
   // right_indices will be JoinNoneValue, i.e. -1. This if path should
   // produce exactly the same result as the else path but will be faster.
   if (left_table_row_count == 0) {
-    thrust::sequence(rmm::exec_policy(stream)->on(stream.value()),
+    thrust::sequence(rmm::exec_policy(stream),
                      right_indices_complement.begin(),
                      right_indices_complement.end(),
                      0);
@@ -160,7 +162,7 @@ get_left_join_indices_complement(rmm::device_vector<size_type> &right_indices,
 
     // invalid_index_map[index_ptr[i]] = 0 for i = 0 to right_table_row_count
     // Thus specifying that those locations are valid
-    thrust::scatter_if(rmm::exec_policy(stream)->on(stream.value()),
+    thrust::scatter_if(rmm::exec_policy(stream),
                        thrust::make_constant_iterator(0),
                        thrust::make_constant_iterator(0) + right_indices.size(),
                        right_indices.begin(),      // Index locations
@@ -171,7 +173,7 @@ get_left_join_indices_complement(rmm::device_vector<size_type> &right_indices,
     size_type end_counter   = static_cast<size_type>(right_table_row_count);
 
     // Create list of indices that have been marked as invalid
-    size_type indices_count = thrust::copy_if(rmm::exec_policy(stream)->on(stream.value()),
+    size_type indices_count = thrust::copy_if(rmm::exec_policy(stream),
                                               thrust::make_counting_iterator(begin_counter),
                                               thrust::make_counting_iterator(end_counter),
                                               invalid_index_map.begin(),
@@ -408,7 +410,9 @@ std::pair<std::unique_ptr<table>, std::unique_ptr<table>> construct_join_output_
   std::vector<size_type> build_noncommon_col =
     non_common_column_indices(build.num_columns(), build_common_col);
 
-  bool const nullify_out_of_bounds{JoinKind != join_kind::INNER_JOIN};
+  out_of_bounds_policy const bounds_policy = JoinKind != join_kind::INNER_JOIN
+                                               ? out_of_bounds_policy::NULLIFY
+                                               : out_of_bounds_policy::DONT_CHECK;
 
   std::unique_ptr<table> common_table = std::make_unique<table>();
   // Construct the joined columns
@@ -419,13 +423,13 @@ std::pair<std::unique_ptr<table>, std::unique_ptr<table>> construct_join_output_
       auto common_from_build = detail::gather(build.select(build_common_col),
                                               complement_indices.second.begin(),
                                               complement_indices.second.end(),
-                                              nullify_out_of_bounds,
+                                              bounds_policy,
                                               stream,
                                               rmm::mr::get_current_device_resource());
       auto common_from_probe = detail::gather(probe.select(probe_common_col),
                                               joined_indices.first.begin(),
                                               joined_indices.first.end(),
-                                              nullify_out_of_bounds,
+                                              bounds_policy,
                                               stream,
                                               rmm::mr::get_current_device_resource());
       common_table           = cudf::detail::concatenate(
@@ -437,7 +441,7 @@ std::pair<std::unique_ptr<table>, std::unique_ptr<table>> construct_join_output_
       common_table = detail::gather(probe.select(probe_common_col),
                                     joined_indices.first.begin(),
                                     joined_indices.first.end(),
-                                    nullify_out_of_bounds,
+                                    bounds_policy,
                                     stream,
                                     mr);
     }
@@ -447,14 +451,14 @@ std::pair<std::unique_ptr<table>, std::unique_ptr<table>> construct_join_output_
   std::unique_ptr<table> probe_table = detail::gather(probe.select(probe_noncommon_col),
                                                       joined_indices.first.begin(),
                                                       joined_indices.first.end(),
-                                                      nullify_out_of_bounds,
+                                                      bounds_policy,
                                                       stream,
                                                       mr);
 
   std::unique_ptr<table> build_table = detail::gather(build.select(build_noncommon_col),
                                                       joined_indices.second.begin(),
                                                       joined_indices.second.end(),
-                                                      nullify_out_of_bounds,
+                                                      bounds_policy,
                                                       stream,
                                                       mr);
 

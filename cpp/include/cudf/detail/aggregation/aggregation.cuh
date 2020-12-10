@@ -24,6 +24,7 @@
 #include <cudf/table/table_device_view.cuh>
 
 #include <rmm/cuda_stream_view.hpp>
+#include <rmm/exec_policy.hpp>
 
 namespace cudf {
 namespace detail {
@@ -68,6 +69,14 @@ struct corresponding_operator<aggregation::PRODUCT> {
 };
 template <>
 struct corresponding_operator<aggregation::SUM_OF_SQUARES> {
+  using type = DeviceSum;
+};
+template <>
+struct corresponding_operator<aggregation::STD> {
+  using type = DeviceSum;
+};
+template <>
+struct corresponding_operator<aggregation::VARIANCE> {
   using type = DeviceSum;
 };
 template <>
@@ -367,7 +376,9 @@ struct identity_initializer {
     return cudf::is_fixed_width<T>() && !is_fixed_point<T>() and
            (k == aggregation::SUM or k == aggregation::MIN or k == aggregation::MAX or
             k == aggregation::COUNT_VALID or k == aggregation::COUNT_ALL or
-            k == aggregation::ARGMAX or k == aggregation::ARGMIN);
+            k == aggregation::ARGMAX or k == aggregation::ARGMIN or
+            k == aggregation::SUM_OF_SQUARES or k == aggregation::STD or
+            k == aggregation::VARIANCE);
   }
 
   template <typename T, aggregation::Kind k>
@@ -413,10 +424,7 @@ struct identity_initializer {
   std::enable_if_t<is_supported<T, k>(), void> operator()(mutable_column_view const& col,
                                                           rmm::cuda_stream_view stream)
   {
-    thrust::fill(rmm::exec_policy(stream)->on(stream.value()),
-                 col.begin<T>(),
-                 col.end<T>(),
-                 get_identity<T, k>());
+    thrust::fill(rmm::exec_policy(stream), col.begin<T>(), col.end<T>(), get_identity<T, k>());
   }
 
   template <typename T, aggregation::Kind k>
