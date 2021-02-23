@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, NVIDIA CORPORATION.
+ * Copyright (c) 2020-2021, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -114,10 +114,9 @@ struct column_scatterer_impl<string_view, MapIterator> {
                                      rmm::cuda_stream_view stream,
                                      rmm::mr::device_memory_resource* mr) const
   {
-    using strings::detail::create_string_vector_from_column;
-    auto const source_vector = create_string_vector_from_column(source, stream.value());
-    auto const begin         = source_vector.begin();
-    auto const end           = begin + std::distance(scatter_map_begin, scatter_map_end);
+    auto d_column    = column_device_view::create(source, stream);
+    auto const begin = d_column->begin<string_view>();
+    auto const end   = begin + cudf::distance(scatter_map_begin, scatter_map_end);
     return strings::detail::scatter(begin, end, scatter_map_begin, target, stream, mr);
   }
 };
